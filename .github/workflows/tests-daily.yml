@@ -1,0 +1,40 @@
+name: Daily Tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: ["11", "17", "21"]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: temurin
+      - name: Compile
+        run: ./gradlew compileJava
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: ["11", "17", "21"]
+    needs: compile
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: temurin
+      - name: Test
+        run: ./gradlew test

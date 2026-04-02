@@ -1,0 +1,16 @@
+dependencies {
+    // Deepgram Java SDK — provides DeepgramTransport / DeepgramTransportFactory interfaces
+    api 'com.deepgram:deepgram-java-sdk:0.2.0'
+
+    // AWS SDK v2 — SageMaker Runtime HTTP/2 bidirectional streaming
+    api platform('software.amazon.awssdk:bom:2.42.0')
+    api 'software.amazon.awssdk:sagemakerruntimehttp2'
+    implementation 'software.amazon.awssdk:netty-nio-client'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.mockito:mockito-core:5.11.0'
+}
+
+test {
+    useJUnitPlatform()
+}

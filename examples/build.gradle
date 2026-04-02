@@ -1,0 +1,14 @@
+plugins {
+    id 'application'
+}
+
+dependencies {
+    implementation project(':sagemaker-transport')
+}
+
+// Run with: ./gradlew :examples:run -PmainClass=com.deepgram.examples.SageMakerTransportExample
+application {
+    mainClass = project.hasProperty('mainClass')
+            ? project.property('mainClass')
+            : 'com.deepgram.examples.SageMakerTransportExample'
+}
