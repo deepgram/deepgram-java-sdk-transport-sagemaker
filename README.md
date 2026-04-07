@@ -22,7 +22,7 @@ dependencies {
 <dependency>
     <groupId>com.deepgram</groupId>
     <artifactId>deepgram-sagemaker</artifactId>
-    <version>0.1.0</version> <!-- x-release-please-version -->
+    <version>0.0.0</version> <!-- x-release-please-version -->
 </dependency>
 ```
 
