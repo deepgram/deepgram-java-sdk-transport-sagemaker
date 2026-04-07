@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.0](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.0...v0.1.0) (2026-04-07)
+
+
+### Bug Fixes
+
+* use project.version for maven publish artifact version ([fdbf0c4](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/fdbf0c4ceac16da6246b7c4db330a732813b4239))
+
+
+### Miscellaneous Chores
+
+* trigger initial release ([aad9c10](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/aad9c1006a8dc6e568e035ce1abdf3b81f59b208))
+
 ## 0.1.0 (2026-04-07)
 
 
