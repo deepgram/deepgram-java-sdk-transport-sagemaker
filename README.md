@@ -11,8 +11,8 @@ SageMaker transport for the [Deepgram Java SDK](https://github.com/deepgram/deep
 
 ```groovy
 dependencies {
-    implementation 'com.deepgram:deepgram-java-sdk:0.2.0'
-    implementation 'com.deepgram:deepgram-sagemaker:0.1.0'
+    implementation 'com.deepgram:deepgram-java-sdk:0.2.1'
+    implementation 'com.deepgram:deepgram-sagemaker:0.0.0' // x-release-please-version
 }
 ```
 
@@ -22,14 +22,14 @@ dependencies {
 <dependency>
     <groupId>com.deepgram</groupId>
     <artifactId>deepgram-sagemaker</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.0</version> <!-- x-release-please-version -->
 </dependency>
 ```
 
 ## Requirements
 
 - Java 11+
-- [Deepgram Java SDK](https://github.com/deepgram/deepgram-java-sdk) v0.2.0+
+- [Deepgram Java SDK](https://github.com/deepgram/deepgram-java-sdk) v0.2.1+
 - AWS credentials configured (environment variables, shared credentials file, or IAM role)
 - A Deepgram model deployed to an AWS SageMaker endpoint
 

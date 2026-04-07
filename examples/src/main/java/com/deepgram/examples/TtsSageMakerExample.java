@@ -12,8 +12,11 @@ import com.deepgram.sagemaker.SageMakerConfig;
 import com.deepgram.sagemaker.SageMakerTransportFactory;
 import com.deepgram.types.SpeakV1Model;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -59,13 +62,14 @@ public class TtsSageMakerExample {
         V1WebSocketClient wsClient = client.speak().v1().v1WebSocket();
         CountDownLatch done = new CountDownLatch(1);
         AtomicInteger audioChunks = new AtomicInteger(0);
+        var closeSent = new java.util.concurrent.atomic.AtomicBoolean(false);
 
-        OutputStream audioOutput = new FileOutputStream(outputFile);
+        ByteArrayOutputStream pcmBuffer = new ByteArrayOutputStream();
 
         wsClient.onSpeakV1Audio(audioData -> {
             try {
                 byte[] bytes = audioData.toByteArray();
-                audioOutput.write(bytes);
+                pcmBuffer.write(bytes);
                 int count = audioChunks.incrementAndGet();
                 System.out.printf("Received audio chunk #%d (%d bytes)%n", count, bytes.length);
             } catch (Exception e) {
@@ -78,12 +82,16 @@ public class TtsSageMakerExample {
         });
 
         wsClient.onError(error -> {
-            System.err.println("Error: " + error.getMessage());
-            done.countDown();
+            if (closeSent.get()) {
+                // Expected — model stream ends after Close
+                done.countDown();
+            } else {
+                System.err.println("Error: " + error.getMessage());
+                done.countDown();
+            }
         });
 
         wsClient.onDisconnected(reason -> {
-            try { audioOutput.close(); } catch (Exception e) { /* ignore */ }
             System.out.println("Closed (code: " + reason.getCode() + ")");
             done.countDown();
         });
@@ -112,6 +120,7 @@ public class TtsSageMakerExample {
         // Wait for audio to arrive
         Thread.sleep(10000);
 
+        closeSent.set(true);
         wsClient.sendClose(
                 SpeakV1Close.builder().type(SpeakV1CloseType.CLOSE).build());
 
@@ -120,6 +129,35 @@ public class TtsSageMakerExample {
         factory.shutdown();
 
         System.out.printf("%nTotal audio chunks: %d%n", audioChunks.get());
+
+        // Write WAV file (24kHz, 16-bit, mono PCM)
+        byte[] pcmData = pcmBuffer.toByteArray();
+        try (OutputStream wav = new FileOutputStream(outputFile)) {
+            int sampleRate = 24000;
+            int bitsPerSample = 16;
+            int channels = 1;
+            int byteRate = sampleRate * channels * bitsPerSample / 8;
+            int blockAlign = channels * bitsPerSample / 8;
+
+            ByteBuffer header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN);
+            header.put("RIFF".getBytes());
+            header.putInt(36 + pcmData.length);
+            header.put("WAVE".getBytes());
+            header.put("fmt ".getBytes());
+            header.putInt(16);              // subchunk size
+            header.putShort((short) 1);     // PCM format
+            header.putShort((short) channels);
+            header.putInt(sampleRate);
+            header.putInt(byteRate);
+            header.putShort((short) blockAlign);
+            header.putShort((short) bitsPerSample);
+            header.put("data".getBytes());
+            header.putInt(pcmData.length);
+
+            wav.write(header.array());
+            wav.write(pcmData);
+        }
+
         System.out.printf("Audio saved to %s%n", outputFile);
 
         // Play audio on macOS

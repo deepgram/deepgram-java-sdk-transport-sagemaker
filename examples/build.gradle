@@ -4,6 +4,7 @@ plugins {
 
 dependencies {
     implementation project(':sagemaker-transport')
+    runtimeOnly 'org.slf4j:slf4j-nop:1.7.36'
 }
 
 // Run with: ./gradlew :examples:run -PmainClass=com.deepgram.examples.SageMakerTransportExample
