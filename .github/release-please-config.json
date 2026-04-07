@@ -17,6 +17,10 @@
         },
         {
           "type": "generic",
+          "path": "pom.xml"
+        },
+        {
+          "type": "generic",
           "path": "README.md"
         }
       ]

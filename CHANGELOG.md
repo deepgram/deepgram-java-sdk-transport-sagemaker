@@ -50,13 +50,3 @@
 * trigger initial release ([f6f1c99](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/f6f1c99749c1645c9145bbc727449e2394d3158b))
 * trigger initial release ([d7aa46c](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/d7aa46c7f54b4d5ff66da7d14cac1759619dd834))
 
-## 0.1.0 (unreleased)
-
-### Features
-
-* Initial deepgram-sagemaker transport package for Java
-* `SageMakerTransport` implementing `DeepgramTransport` from the Deepgram Java SDK
-* `SageMakerTransportFactory` implementing `DeepgramTransportFactory`
-* `SageMakerConfig` builder for endpoint name, region, content type, and accept type
-* HTTP/2 response streaming via AWS SDK v2 async client
-* Example showing SDK integration with `DeepgramClient.builder().transportFactory()`
