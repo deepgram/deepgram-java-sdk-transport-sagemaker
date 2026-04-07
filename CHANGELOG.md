@@ -3,6 +3,13 @@
 ## [0.1.0](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.0...v0.1.0) (2026-04-07)
 
 
+### Bug Fixes
+
+* switch to maven for central publishing ([d6f915f](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/d6f915f89b4e4b192039f7d20b2e4025abeeea78))
+
+## [0.1.0](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.0...v0.1.0) (2026-04-07)
+
+
 ### Features
 
 * add maven central publishing and transport fixes ([2113022](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/2113022f5b015f3b5ec793cc512354687bd4a48f))
@@ -49,4 +56,3 @@
 
 * trigger initial release ([f6f1c99](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/f6f1c99749c1645c9145bbc727449e2394d3158b))
 * trigger initial release ([d7aa46c](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/d7aa46c7f54b4d5ff66da7d14cac1759619dd834))
-
