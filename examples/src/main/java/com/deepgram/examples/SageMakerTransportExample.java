@@ -8,6 +8,7 @@ import com.deepgram.resources.listen.v1.websocket.V1ConnectOptions;
 import com.deepgram.resources.listen.v1.websocket.V1WebSocketClient;
 import com.deepgram.sagemaker.SageMakerConfig;
 import com.deepgram.sagemaker.SageMakerTransportFactory;
+import com.deepgram.types.ListenV1InterimResults;
 import com.deepgram.types.ListenV1Model;
 
 import java.io.RandomAccessFile;
@@ -99,6 +100,7 @@ public class SageMakerTransportExample {
         CompletableFuture<Void> connectFuture = wsClient.connect(
                 V1ConnectOptions.builder()
                         .model(model)
+                        .interimResults(ListenV1InterimResults.TRUE)
                         .build());
         connectFuture.get(10, TimeUnit.SECONDS);
 
