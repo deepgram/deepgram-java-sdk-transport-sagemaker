@@ -151,6 +151,7 @@ public class SageMakerTransport implements DeepgramTransport {
         ensureConnected();
         RequestStreamEvent event = RequestStreamEvent.payloadPartBuilder()
                 .bytes(SdkBytes.fromByteArray(data.getBytes(StandardCharsets.UTF_8)))
+                .dataType("UTF8")
                 .build();
         inputPublisher.send(event);
 
@@ -174,22 +175,17 @@ public class SageMakerTransport implements DeepgramTransport {
     private void handlePayloadPart(ResponsePayloadPart part) {
         byte[] bytes = part.bytes().asByteArray();
 
-        // Try to interpret as text (JSON transcript results)
-        try {
+        // JSON messages start with '{"' (0x7B 0x22). Checking two bytes avoids
+        // false positives from binary audio chunks that happen to start with 0x7B.
+        if (bytes.length > 1 && bytes[0] == '{' && bytes[1] == '"') {
             String text = new String(bytes, StandardCharsets.UTF_8);
-            if (text.startsWith("{")) {
-                for (Consumer<String> l : messageListeners) {
-                    l.accept(text);
-                }
-                return;
+            for (Consumer<String> l : messageListeners) {
+                l.accept(text);
             }
-        } catch (Exception ignored) {
-            // Not valid UTF-8 text — treat as binary
-        }
-
-        // Otherwise deliver as binary (audio data for TTS responses)
-        for (Consumer<byte[]> l : binaryListeners) {
-            l.accept(bytes);
+        } else {
+            for (Consumer<byte[]> l : binaryListeners) {
+                l.accept(bytes);
+            }
         }
     }
 
