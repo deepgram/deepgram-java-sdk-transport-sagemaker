@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.0...v0.1.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* configure HTTP/2 maxStreams=1 to prevent bidi stream starvation ([29dc4b8](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/29dc4b839ea8c4a98e6d6b568d0d3084ec87ff8c))
+* configure HTTP/2 maxStreams=1 to prevent bidi stream starvation ([#10](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/issues/10)) ([da68ffc](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/da68ffcee2d01827ae207fe5b7dd3f1b48ade151))
+
 ## [0.1.0](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.0...v0.1.0) (2026-04-07)
 
 
