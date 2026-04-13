@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.1...v0.1.2) (2026-04-13)
+
+
+### Bug Fixes
+
+* change netty-nio-client Maven scope from runtime to compile ([3faa74b](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/3faa74bc3cc401eb113cccc12335bfcef3b0af8a))
+* change netty-nio-client Maven scope from runtime to compile ([#12](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/issues/12)) ([df86a2d](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/df86a2d3c260d88f1b2171119802f294133864ae))
+
 ## [0.1.1](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.0...v0.1.1) (2026-04-13)
 
 
