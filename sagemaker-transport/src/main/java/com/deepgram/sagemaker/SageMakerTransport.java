@@ -118,7 +118,8 @@ public class SageMakerTransport implements DeepgramTransport {
 
             // Wait for the SDK to subscribe to our publisher before sending events
             try {
-                inputPublisher.awaitSubscription(30, TimeUnit.SECONDS);
+                inputPublisher.awaitSubscription(
+                        config.subscriptionTimeout().toMillis(), TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException("Interrupted waiting for stream subscription", e);
