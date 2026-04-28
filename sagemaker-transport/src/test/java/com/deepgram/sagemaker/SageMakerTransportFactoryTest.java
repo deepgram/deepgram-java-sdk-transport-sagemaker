@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 import com.deepgram.core.transport.DeepgramTransport;
+import java.time.Duration;
 import java.util.Map;
 
 import software.amazon.awssdk.regions.Region;
@@ -61,5 +62,63 @@ class SageMakerTransportFactoryTest {
         SageMakerConfig.builder().endpointName("my-endpoint").region("eu-west-1").build();
 
     assertEquals(Region.EU_WEST_1, config.region());
+  }
+
+  @Test
+  void configDefaultsAreLenientForHighConcurrency() {
+    SageMakerConfig config = SageMakerConfig.builder().endpointName("my-endpoint").build();
+
+    assertEquals(Duration.ofSeconds(30), config.connectionTimeout());
+    assertEquals(Duration.ofSeconds(60), config.connectionAcquireTimeout());
+    assertEquals(Duration.ofSeconds(60), config.subscriptionTimeout());
+    assertEquals(500, config.maxConcurrency());
+  }
+
+  @Test
+  void configAcceptsCustomTimeoutsAndConcurrency() {
+    SageMakerConfig config =
+        SageMakerConfig.builder()
+            .endpointName("my-endpoint")
+            .connectionTimeout(Duration.ofSeconds(5))
+            .connectionAcquireTimeout(Duration.ofSeconds(15))
+            .subscriptionTimeout(Duration.ofSeconds(45))
+            .maxConcurrency(1000)
+            .build();
+
+    assertEquals(Duration.ofSeconds(5), config.connectionTimeout());
+    assertEquals(Duration.ofSeconds(15), config.connectionAcquireTimeout());
+    assertEquals(Duration.ofSeconds(45), config.subscriptionTimeout());
+    assertEquals(1000, config.maxConcurrency());
+  }
+
+  @Test
+  void configRejectsNonPositiveTimeouts() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> SageMakerConfig.builder().endpointName("e").connectionTimeout(Duration.ZERO).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            SageMakerConfig.builder()
+                .endpointName("e")
+                .connectionAcquireTimeout(Duration.ofSeconds(-1))
+                .build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            SageMakerConfig.builder()
+                .endpointName("e")
+                .subscriptionTimeout(null)
+                .build());
+  }
+
+  @Test
+  void configRejectsNonPositiveMaxConcurrency() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> SageMakerConfig.builder().endpointName("e").maxConcurrency(0).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> SageMakerConfig.builder().endpointName("e").maxConcurrency(-1).build());
   }
 }

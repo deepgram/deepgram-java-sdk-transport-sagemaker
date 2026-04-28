@@ -95,11 +95,38 @@ The transport is transparent — the SDK API is identical whether using Deepgram
 |-----------|----------|---------|-------------|
 | `endpointName` | Yes | — | SageMaker endpoint name |
 | `region` | No | `us-west-2` | AWS region |
+| `connectionTimeout` | No | `30s` | Max time for the underlying TCP/TLS connect (AWS Netty default is 2&nbsp;s — bumped here so cold-start endpoints under burst load have time to accept TLS handshakes). |
+| `connectionAcquireTimeout` | No | `60s` | Max time to acquire a connection from the Netty pool (AWS Netty default is 10&nbsp;s — bumped so a 200&ndash;500-stream burst doesn't drain the acquire pool). |
+| `subscriptionTimeout` | No | `60s` | Max time the transport waits for the AWS SDK to subscribe to the bidi-stream input publisher before failing the first send. |
+| `maxConcurrency` | No | `500` | Max simultaneous in-flight HTTP/2 streams across the shared Netty pool. With `maxStreams=1` this is the cap on simultaneous bidirectional streams. |
 
 ```java
 SageMakerConfig config = SageMakerConfig.builder()
     .endpointName("my-deepgram-endpoint")
     .region("us-east-2")
+    .build();
+```
+
+#### High-concurrency notes
+
+The transport's defaults are tuned for high-burst workloads (large numbers of
+streams opened in a tight loop against an endpoint that may need to scale up).
+If you're opening 200&ndash;500 streams simultaneously against a cold endpoint,
+the AWS Netty defaults (2&nbsp;s connect / 10&nbsp;s acquire) will fire before
+the load balancer has accepted all of the inbound TLS handshakes &mdash; you'll
+see a wave of `connection acquire` and `connect timed out` errors that look
+like server-side problems but are really client-side fail-fast tripping early.
+
+This transport ships with more lenient defaults (30&nbsp;s / 60&nbsp;s) so the
+common high-concurrency path works out of the box. Tighten them if you need
+fail-fast behavior in low-latency pipelines:
+
+```java
+SageMakerConfig config = SageMakerConfig.builder()
+    .endpointName("my-deepgram-endpoint")
+    .region("us-east-2")
+    .connectionTimeout(Duration.ofSeconds(5))
+    .connectionAcquireTimeout(Duration.ofSeconds(15))
     .build();
 ```
 

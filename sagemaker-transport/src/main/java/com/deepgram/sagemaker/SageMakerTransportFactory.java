@@ -39,14 +39,6 @@ public class SageMakerTransportFactory implements DeepgramTransportFactory {
     private final SageMakerConfig config;
     private final SageMakerRuntimeHttp2AsyncClient smClient;
 
-    /**
-     * Default max concurrent HTTP/2 streams (in-flight requests) across the
-     * shared connection pool.  With {@code maxStreams=1} each stream gets its
-     * own TCP connection, so this value equals the maximum number of
-     * simultaneous bidirectional streams the factory can support.
-     */
-    private static final int DEFAULT_MAX_CONCURRENCY = 500;
-
     public SageMakerTransportFactory(SageMakerConfig config) {
         this.config = config;
         this.smClient = SageMakerRuntimeHttp2AsyncClient.builder()
@@ -54,7 +46,9 @@ public class SageMakerTransportFactory implements DeepgramTransportFactory {
                 .httpClientBuilder(
                         NettyNioAsyncHttpClient.builder()
                                 .protocol(Protocol.HTTP2)
-                                .maxConcurrency(DEFAULT_MAX_CONCURRENCY)
+                                .maxConcurrency(config.maxConcurrency())
+                                .connectionTimeout(config.connectionTimeout())
+                                .connectionAcquisitionTimeout(config.connectionAcquireTimeout())
                                 .http2Configuration(
                                         Http2Configuration.builder()
                                                 .maxStreams(1L)
