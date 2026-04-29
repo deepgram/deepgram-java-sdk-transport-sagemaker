@@ -3,6 +3,7 @@ package com.deepgram.sagemaker;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
+import com.deepgram.core.ReconnectingWebSocketListener;
 import com.deepgram.core.transport.DeepgramTransport;
 import java.time.Duration;
 import java.util.Map;
@@ -120,5 +121,72 @@ class SageMakerTransportFactoryTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> SageMakerConfig.builder().endpointName("e").maxConcurrency(-1).build());
+  }
+
+  @Test
+  void retryConfigDefaults() {
+    SageMakerConfig config = SageMakerConfig.builder().endpointName("my-endpoint").build();
+
+    assertEquals(5, config.maxRetries());
+    assertEquals(Duration.ofMillis(100), config.initialBackoff());
+    assertEquals(Duration.ofSeconds(5), config.maxBackoff());
+    assertEquals(2.0, config.backoffMultiplier());
+    assertEquals(Duration.ofSeconds(30), config.retryBudget());
+  }
+
+  @Test
+  void retryConfigAcceptsCustomValues() {
+    SageMakerConfig config =
+        SageMakerConfig.builder()
+            .endpointName("my-endpoint")
+            .maxRetries(10)
+            .initialBackoff(Duration.ofMillis(50))
+            .maxBackoff(Duration.ofSeconds(20))
+            .backoffMultiplier(3.0)
+            .retryBudget(Duration.ofMinutes(2))
+            .build();
+
+    assertEquals(10, config.maxRetries());
+    assertEquals(Duration.ofMillis(50), config.initialBackoff());
+    assertEquals(Duration.ofSeconds(20), config.maxBackoff());
+    assertEquals(3.0, config.backoffMultiplier());
+    assertEquals(Duration.ofMinutes(2), config.retryBudget());
+  }
+
+  @Test
+  void retryConfigValidates() {
+    assertThrows(IllegalArgumentException.class,
+        () -> SageMakerConfig.builder().endpointName("e").maxRetries(-1).build());
+    assertThrows(IllegalArgumentException.class,
+        () -> SageMakerConfig.builder().endpointName("e").initialBackoff(Duration.ZERO).build());
+    assertThrows(IllegalArgumentException.class,
+        () -> SageMakerConfig.builder().endpointName("e").maxBackoff(Duration.ofSeconds(-1)).build());
+    assertThrows(IllegalArgumentException.class,
+        () -> SageMakerConfig.builder().endpointName("e").backoffMultiplier(0.5).build());
+    assertThrows(IllegalArgumentException.class,
+        () -> SageMakerConfig.builder().endpointName("e").retryBudget(null).build());
+  }
+
+  @Test
+  void retryConfigRejectsInitialGreaterThanMax() {
+    assertThrows(IllegalArgumentException.class,
+        () -> SageMakerConfig.builder()
+                .endpointName("e")
+                .initialBackoff(Duration.ofSeconds(10))
+                .maxBackoff(Duration.ofSeconds(5))
+                .build());
+  }
+
+  @Test
+  void factoryDeclaresMaxRetriesZeroForReconnectOptions() {
+    // The plugin declares maxRetries(0) so the SDK's wrapper-level reconnect doesn't compound
+    // SageMaker's internal retries into a storm.
+    SageMakerConfig config = SageMakerConfig.builder().endpointName("my-endpoint").build();
+    SageMakerRuntimeHttp2AsyncClient mockClient = mock(SageMakerRuntimeHttp2AsyncClient.class);
+    SageMakerTransportFactory factory = new SageMakerTransportFactory(config, mockClient);
+
+    ReconnectingWebSocketListener.ReconnectOptions opts = factory.reconnectOptions();
+    assertNotNull(opts);
+    assertEquals(0, opts.maxRetries);
   }
 }

@@ -33,6 +33,21 @@ public class SageMakerConfig {
      */
     public static final int DEFAULT_MAX_CONCURRENCY = 500;
 
+    /** Max retries on transient AWS errors (throttling, pool-exhausted, transient connect) per stream. */
+    public static final int DEFAULT_MAX_RETRIES = 5;
+
+    /** First backoff delay after the initial failure. */
+    public static final Duration DEFAULT_INITIAL_BACKOFF = Duration.ofMillis(100);
+
+    /** Cap on the per-attempt backoff delay regardless of multiplier. */
+    public static final Duration DEFAULT_MAX_BACKOFF = Duration.ofSeconds(5);
+
+    /** Exponential growth factor applied between retry attempts. */
+    public static final double DEFAULT_BACKOFF_MULTIPLIER = 2.0;
+
+    /** Total wall-clock budget across all retry attempts before giving up and surfacing the error. */
+    public static final Duration DEFAULT_RETRY_BUDGET = Duration.ofSeconds(30);
+
     private final String endpointName;
     private final Region region;
     private final String contentType;
@@ -41,6 +56,11 @@ public class SageMakerConfig {
     private final Duration connectionAcquireTimeout;
     private final Duration subscriptionTimeout;
     private final int maxConcurrency;
+    private final int maxRetries;
+    private final Duration initialBackoff;
+    private final Duration maxBackoff;
+    private final double backoffMultiplier;
+    private final Duration retryBudget;
 
     private SageMakerConfig(Builder builder) {
         this.endpointName = builder.endpointName;
@@ -51,6 +71,11 @@ public class SageMakerConfig {
         this.connectionAcquireTimeout = builder.connectionAcquireTimeout;
         this.subscriptionTimeout = builder.subscriptionTimeout;
         this.maxConcurrency = builder.maxConcurrency;
+        this.maxRetries = builder.maxRetries;
+        this.initialBackoff = builder.initialBackoff;
+        this.maxBackoff = builder.maxBackoff;
+        this.backoffMultiplier = builder.backoffMultiplier;
+        this.retryBudget = builder.retryBudget;
     }
 
     public String endpointName() { return endpointName; }
@@ -61,6 +86,11 @@ public class SageMakerConfig {
     public Duration connectionAcquireTimeout() { return connectionAcquireTimeout; }
     public Duration subscriptionTimeout() { return subscriptionTimeout; }
     public int maxConcurrency() { return maxConcurrency; }
+    public int maxRetries() { return maxRetries; }
+    public Duration initialBackoff() { return initialBackoff; }
+    public Duration maxBackoff() { return maxBackoff; }
+    public double backoffMultiplier() { return backoffMultiplier; }
+    public Duration retryBudget() { return retryBudget; }
 
     public static Builder builder() {
         return new Builder();
@@ -75,6 +105,11 @@ public class SageMakerConfig {
         private Duration connectionAcquireTimeout = DEFAULT_CONNECTION_ACQUIRE_TIMEOUT;
         private Duration subscriptionTimeout = DEFAULT_SUBSCRIPTION_TIMEOUT;
         private int maxConcurrency = DEFAULT_MAX_CONCURRENCY;
+        private int maxRetries = DEFAULT_MAX_RETRIES;
+        private Duration initialBackoff = DEFAULT_INITIAL_BACKOFF;
+        private Duration maxBackoff = DEFAULT_MAX_BACKOFF;
+        private double backoffMultiplier = DEFAULT_BACKOFF_MULTIPLIER;
+        private Duration retryBudget = DEFAULT_RETRY_BUDGET;
 
         public Builder endpointName(String endpointName) {
             this.endpointName = endpointName;
@@ -154,9 +189,63 @@ public class SageMakerConfig {
             return this;
         }
 
+        /**
+         * Max retries on transient AWS errors per stream invocation. Set to {@code 0} to disable
+         * internal retry. Transient errors include throttling, connection-pool exhaustion, and
+         * transient connect/timeout failures; terminal errors (auth, validation) bypass this and
+         * surface to the application immediately.
+         */
+        public Builder maxRetries(int maxRetries) {
+            if (maxRetries < 0) {
+                throw new IllegalArgumentException("maxRetries must be non-negative");
+            }
+            this.maxRetries = maxRetries;
+            return this;
+        }
+
+        /** First backoff delay applied after the initial failure. */
+        public Builder initialBackoff(Duration initialBackoff) {
+            if (initialBackoff == null || initialBackoff.isNegative() || initialBackoff.isZero()) {
+                throw new IllegalArgumentException("initialBackoff must be positive");
+            }
+            this.initialBackoff = initialBackoff;
+            return this;
+        }
+
+        /** Cap on the per-attempt backoff delay regardless of multiplier. */
+        public Builder maxBackoff(Duration maxBackoff) {
+            if (maxBackoff == null || maxBackoff.isNegative() || maxBackoff.isZero()) {
+                throw new IllegalArgumentException("maxBackoff must be positive");
+            }
+            this.maxBackoff = maxBackoff;
+            return this;
+        }
+
+        /** Exponential growth factor applied between retry attempts. Must be {@code >= 1.0}. */
+        public Builder backoffMultiplier(double backoffMultiplier) {
+            if (backoffMultiplier < 1.0) {
+                throw new IllegalArgumentException("backoffMultiplier must be >= 1.0");
+            }
+            this.backoffMultiplier = backoffMultiplier;
+            return this;
+        }
+
+        /** Total wall-clock budget across all retry attempts before giving up. */
+        public Builder retryBudget(Duration retryBudget) {
+            if (retryBudget == null || retryBudget.isNegative() || retryBudget.isZero()) {
+                throw new IllegalArgumentException("retryBudget must be positive");
+            }
+            this.retryBudget = retryBudget;
+            return this;
+        }
+
         public SageMakerConfig build() {
             if (endpointName == null || endpointName.isBlank()) {
                 throw new IllegalArgumentException("endpointName is required");
+            }
+            if (initialBackoff.compareTo(maxBackoff) > 0) {
+                throw new IllegalArgumentException("initialBackoff (" + initialBackoff
+                        + ") must not exceed maxBackoff (" + maxBackoff + ")");
             }
             return new SageMakerConfig(this);
         }

@@ -1,6 +1,6 @@
 dependencies {
     // Deepgram Java SDK — provides DeepgramTransport / DeepgramTransportFactory interfaces
-    api 'com.deepgram:deepgram-java-sdk:0.2.1'
+    api 'com.deepgram:deepgram-java-sdk:0.3.0'
 
     // AWS SDK v2 — SageMaker Runtime HTTP/2 bidirectional streaming
     api platform('software.amazon.awssdk:bom:2.42.0')

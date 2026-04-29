@@ -11,7 +11,7 @@ SageMaker transport for the [Deepgram Java SDK](https://github.com/deepgram/deep
 
 ```groovy
 dependencies {
-    implementation 'com.deepgram:deepgram-java-sdk:0.2.1'
+    implementation 'com.deepgram:deepgram-java-sdk:0.3.0'
     implementation 'com.deepgram:deepgram-sagemaker:0.1.2' // x-release-please-version
 }
 ```
@@ -29,7 +29,7 @@ dependencies {
 ## Requirements
 
 - Java 11+
-- [Deepgram Java SDK](https://github.com/deepgram/deepgram-java-sdk) v0.2.1+
+- [Deepgram Java SDK](https://github.com/deepgram/deepgram-java-sdk) v0.3.0+ (the `default ReconnectOptions reconnectOptions()` hook on `DeepgramTransportFactory` is required for storm absorption)
 - AWS credentials configured (environment variables, shared credentials file, or IAM role)
 - A Deepgram model deployed to an AWS SageMaker endpoint
 
@@ -97,8 +97,13 @@ The transport is transparent — the SDK API is identical whether using Deepgram
 | `region` | No | `us-west-2` | AWS region |
 | `connectionTimeout` | No | `30s` | Max time for the underlying TCP/TLS connect (AWS Netty default is 2&nbsp;s — bumped here so cold-start endpoints under burst load have time to accept TLS handshakes). |
 | `connectionAcquireTimeout` | No | `60s` | Max time to acquire a connection from the Netty pool (AWS Netty default is 10&nbsp;s — bumped so a 200&ndash;500-stream burst doesn't drain the acquire pool). |
-| `subscriptionTimeout` | No | `60s` | Max time the transport waits for the AWS SDK to subscribe to the bidi-stream input publisher before failing the first send. |
+| `subscriptionTimeout` | No | `60s` | Max time the transport waits for the AWS SDK to subscribe to the bidi-stream input publisher before failing. A timeout here is treated as a transient connect failure and counts against `maxRetries` / `retryBudget`. |
 | `maxConcurrency` | No | `500` | Max simultaneous in-flight HTTP/2 streams across the shared Netty pool. With `maxStreams=1` this is the cap on simultaneous bidirectional streams. |
+| `maxRetries` | No | `5` | Max retries on transient AWS errors (throttling, pool-exhausted, transient connect/timeout). Set to `0` to disable internal retry. Terminal errors (auth, validation) bypass this. |
+| `initialBackoff` | No | `100ms` | First backoff delay applied after the initial failure. |
+| `maxBackoff` | No | `5s` | Cap on the per-attempt backoff delay regardless of multiplier. |
+| `backoffMultiplier` | No | `2.0` | Exponential growth factor between retry attempts. Must be `>= 1.0`. |
+| `retryBudget` | No | `30s` | Total wall-clock cap across all retry attempts before giving up and surfacing the error to listeners. |
 
 ```java
 SageMakerConfig config = SageMakerConfig.builder()
@@ -129,6 +134,36 @@ SageMakerConfig config = SageMakerConfig.builder()
     .connectionAcquireTimeout(Duration.ofSeconds(15))
     .build();
 ```
+
+#### Retry & storm absorption
+
+Transient AWS-side failures (`ThrottlingException`, connection-pool exhaustion, transient
+connect/timeout failures) are absorbed by the transport itself: classified as retryable, retried
+with exponential backoff up to `maxRetries` and `retryBudget`, with messages enqueued during the
+reset window persisted across the reconnect so audio isn't dropped. Only **terminal** errors (auth,
+validation) and budget-exhausted retryable errors propagate to `transport.onError(...)` and reach
+the application's error handler.
+
+This means the SDK's wrapper-level reconnect (`ReconnectingWebSocketListener`) would compound the
+plugin's internal retries into a Throttling-on-Throttling storm under burst load, so the plugin
+declares `ReconnectOptions.builder().maxRetries(0).build()` via the
+`DeepgramTransportFactory.reconnectOptions()` hook. The SDK applies it automatically when it sees
+a `transportFactory` in use; no user wiring required.
+
+To tune retry behavior:
+
+```java
+SageMakerConfig config = SageMakerConfig.builder()
+    .endpointName("my-deepgram-endpoint")
+    .maxRetries(10)
+    .initialBackoff(Duration.ofMillis(200))
+    .maxBackoff(Duration.ofSeconds(10))
+    .retryBudget(Duration.ofMinutes(1))
+    .build();
+```
+
+Set `maxRetries(0)` to disable internal retry entirely (every transient AWS error then surfaces
+immediately to the application).
 
 ### Custom AWS Client
 

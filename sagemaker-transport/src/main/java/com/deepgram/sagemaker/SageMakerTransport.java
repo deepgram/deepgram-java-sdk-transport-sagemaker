@@ -2,13 +2,17 @@ package com.deepgram.sagemaker;
 
 import com.deepgram.core.transport.DeepgramTransport;
 
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
 import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.SageMakerRuntimeHttp2AsyncClient;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.model.InvokeEndpointWithBidirectionalStreamRequest;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.model.InvokeEndpointWithBidirectionalStreamResponseHandler;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.model.RequestStreamEvent;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.model.ResponsePayloadPart;
 
+import java.io.IOException;
+import java.net.ConnectException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,7 +20,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import org.reactivestreams.Publisher;
@@ -59,6 +65,14 @@ public class SageMakerTransport implements DeepgramTransport {
     private volatile CompletableFuture<Void> streamFuture;
     private final Object connectLock = new Object();
 
+    // Hoisted out of StreamPublisher so messages queued during an internal reset survive into the
+    // next stream attempt instead of being dropped with the discarded publisher.
+    private final ConcurrentLinkedQueue<RequestStreamEvent> pending = new ConcurrentLinkedQueue<>();
+
+    // Retry budget tracking. Reset to 0 once a stream successfully establishes (subscription).
+    private final AtomicInteger retryAttempt = new AtomicInteger(0);
+    private volatile long retryWindowStart = 0L;
+
     SageMakerTransport(
             SageMakerRuntimeHttp2AsyncClient smClient,
             SageMakerConfig config,
@@ -71,62 +85,180 @@ public class SageMakerTransport implements DeepgramTransport {
     }
 
     /**
-     * Establish the bidirectional stream if not already connected.
-     * Blocks until the SDK has subscribed to the event publisher.
+     * Establish the bidirectional stream if not already connected. Blocks until the AWS SDK
+     * subscribes to the event publisher.
+     *
+     * <p>Internally retries with exponential backoff on transient AWS errors (throttling,
+     * connection-pool exhaustion, transient connect/timeout failures) bounded by
+     * {@link SageMakerConfig#maxRetries()} and {@link SageMakerConfig#retryBudget()}. Terminal
+     * errors (auth, validation) and budget exhaustion bubble out and surface to {@code errorListeners}
+     * via the caller's {@code send*} path.
      */
     private void ensureConnected() {
         if (connected.get()) return;
         synchronized (connectLock) {
             if (connected.get()) return;
 
-            inputPublisher = new StreamPublisher();
-
-            InvokeEndpointWithBidirectionalStreamRequest.Builder requestBuilder =
-                    InvokeEndpointWithBidirectionalStreamRequest.builder()
-                            .endpointName(config.endpointName())
-                            .modelInvocationPath(invocationPath);
-            if (queryString != null && !queryString.isEmpty()) {
-                requestBuilder.modelQueryString(queryString);
-            }
-            InvokeEndpointWithBidirectionalStreamRequest request = requestBuilder.build();
-
-            InvokeEndpointWithBidirectionalStreamResponseHandler handler =
-                    InvokeEndpointWithBidirectionalStreamResponseHandler.builder()
-                            .onResponse(response -> { })
-                            .subscriber(InvokeEndpointWithBidirectionalStreamResponseHandler
-                                    .Visitor.builder()
-                                    .onPayloadPart(this::handlePayloadPart)
-                                    .build())
-                            .onError(error -> {
-                                if (closeSent.get()) {
-                                    // Model idle timeout after CloseStream — treat as normal close.
-                                    inputPublisher.complete();
-                                    notifyClose(1000, "Normal");
-                                } else {
-                                    for (Consumer<Throwable> l : errorListeners) {
-                                        l.accept(error);
-                                    }
-                                }
-                            })
-                            .onComplete(() -> {
-                                notifyClose(1000, "Normal");
-                            })
-                            .build();
-
-            streamFuture = smClient.invokeEndpointWithBidirectionalStream(
-                    request, inputPublisher, handler);
-
-            // Wait for the SDK to subscribe to our publisher before sending events
-            try {
-                inputPublisher.awaitSubscription(
-                        config.subscriptionTimeout().toMillis(), TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("Interrupted waiting for stream subscription", e);
+            if (retryWindowStart == 0L) {
+                retryWindowStart = System.currentTimeMillis();
             }
 
-            connected.set(true);
+            Throwable lastError = null;
+            while (true) {
+                try {
+                    attemptConnect();
+                    // Success: reset retry budget for any future internal reconnects on this transport.
+                    retryAttempt.set(0);
+                    retryWindowStart = 0L;
+                    connected.set(true);
+                    return;
+                } catch (Throwable t) {
+                    lastError = t;
+                    Classification c = classify(t);
+                    int attempt = retryAttempt.get();
+                    long elapsed = System.currentTimeMillis() - retryWindowStart;
+                    boolean budgetLeft = attempt < config.maxRetries()
+                            && elapsed < config.retryBudget().toMillis();
+                    if (c == Classification.TERMINAL || !budgetLeft) {
+                        if (t instanceof RuntimeException) throw (RuntimeException) t;
+                        throw new RuntimeException(t);
+                    }
+                    long backoff = computeBackoff(attempt);
+                    retryAttempt.incrementAndGet();
+                    try {
+                        Thread.sleep(backoff);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException(
+                                "Interrupted during retry backoff after " + (attempt + 1) + " attempts", lastError);
+                    }
+                }
+            }
         }
+    }
+
+    /** Single connect attempt — invokes the bidi stream and waits for subscription. */
+    private void attemptConnect() throws TimeoutException, InterruptedException {
+        StreamPublisher publisher = new StreamPublisher(pending);
+        inputPublisher = publisher;
+
+        InvokeEndpointWithBidirectionalStreamRequest.Builder requestBuilder =
+                InvokeEndpointWithBidirectionalStreamRequest.builder()
+                        .endpointName(config.endpointName())
+                        .modelInvocationPath(invocationPath);
+        if (queryString != null && !queryString.isEmpty()) {
+            requestBuilder.modelQueryString(queryString);
+        }
+        InvokeEndpointWithBidirectionalStreamRequest request = requestBuilder.build();
+
+        InvokeEndpointWithBidirectionalStreamResponseHandler handler =
+                InvokeEndpointWithBidirectionalStreamResponseHandler.builder()
+                        .onResponse(response -> { })
+                        .subscriber(InvokeEndpointWithBidirectionalStreamResponseHandler
+                                .Visitor.builder()
+                                .onPayloadPart(this::handlePayloadPart)
+                                .build())
+                        .onError(this::handleStreamError)
+                        .onComplete(() -> notifyClose(1000, "Normal"))
+                        .build();
+
+        streamFuture = smClient.invokeEndpointWithBidirectionalStream(request, publisher, handler);
+
+        if (!publisher.awaitSubscription(config.subscriptionTimeout().toMillis(), TimeUnit.MILLISECONDS)) {
+            // Subscription never landed — treat as a transient connect failure so the retry loop
+            // classifies and (if budget allows) tries again on a fresh stream.
+            try {
+                streamFuture.cancel(true);
+            } catch (Throwable ignored) {
+                // best-effort
+            }
+            throw new TimeoutException(
+                    "Timed out waiting for AWS SDK to subscribe to stream publisher after "
+                            + config.subscriptionTimeout());
+        }
+    }
+
+    /**
+     * Async error gate: AWS SDK reports stream errors via the response handler's onError. Classify
+     * here so transient AWS errors trigger an internal reset (next send re-enters ensureConnected
+     * via the retry loop) instead of bubbling straight to {@code errorListeners}.
+     */
+    private void handleStreamError(Throwable error) {
+        if (closeSent.get()) {
+            // Model idle timeout after CloseStream — treat as normal close.
+            if (inputPublisher != null) inputPublisher.complete();
+            notifyClose(1000, "Normal");
+            return;
+        }
+
+        Classification c = classify(error);
+        int attempt = retryAttempt.get();
+        long windowStart = retryWindowStart;
+        long elapsed = windowStart == 0L ? 0L : System.currentTimeMillis() - windowStart;
+        boolean budgetLeft = attempt < config.maxRetries()
+                && elapsed < config.retryBudget().toMillis();
+
+        if (c == Classification.RETRYABLE && budgetLeft) {
+            // Internal reset: drop current stream, mark disconnected. Next send re-enters
+            // ensureConnected → attemptConnect, which will drain `pending` into the new stream.
+            connected.set(false);
+            if (inputPublisher != null) inputPublisher.complete();
+            if (streamFuture != null) {
+                try {
+                    streamFuture.cancel(true);
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+            }
+            return;
+        }
+
+        // Terminal or budget-exhausted: surface to listeners.
+        for (Consumer<Throwable> l : errorListeners) {
+            l.accept(error);
+        }
+    }
+
+    private long computeBackoff(int attempt) {
+        long initial = config.initialBackoff().toMillis();
+        long max = config.maxBackoff().toMillis();
+        double scaled = initial * Math.pow(config.backoffMultiplier(), attempt);
+        if (scaled > max || Double.isInfinite(scaled)) {
+            return max;
+        }
+        return Math.max(initial, (long) scaled);
+    }
+
+    enum Classification { RETRYABLE, TERMINAL }
+
+    /**
+     * Classify an AWS-side exception as transient (retry internally, don't surface) vs terminal
+     * (surface to {@code errorListeners}). Walks the cause chain so SDK-wrapped exceptions are
+     * inspected too.
+     */
+    static Classification classify(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            if (t instanceof TimeoutException) return Classification.RETRYABLE;
+            if (t instanceof ConnectException) return Classification.RETRYABLE;
+            if (t instanceof IOException) return Classification.RETRYABLE;
+            if (t instanceof AwsServiceException) {
+                AwsServiceException ase = (AwsServiceException) t;
+                int status = ase.statusCode();
+                if (status == 429 || (status >= 500 && status < 600)) return Classification.RETRYABLE;
+                String code = ase.awsErrorDetails() != null ? ase.awsErrorDetails().errorCode() : null;
+                if (code != null && code.toLowerCase().contains("throttl")) return Classification.RETRYABLE;
+                return Classification.TERMINAL;
+            }
+            if (t instanceof SdkException) {
+                String msg = t.getMessage() == null ? "" : t.getMessage().toLowerCase();
+                if (msg.contains("acquire") || msg.contains("pool") || msg.contains("throttl")
+                        || msg.contains("timeout")) {
+                    return Classification.RETRYABLE;
+                }
+            }
+            if (t == t.getCause()) break;
+        }
+        return Classification.TERMINAL;
     }
 
     @Override
@@ -224,6 +356,8 @@ public class SageMakerTransport implements DeepgramTransport {
     @Override
     public void close() {
         if (!open.compareAndSet(true, false)) return;
+        // Terminal close — drop any messages that were queued during a reset window.
+        pending.clear();
         if (inputPublisher != null) {
             inputPublisher.complete();
         }
@@ -235,12 +369,20 @@ public class SageMakerTransport implements DeepgramTransport {
     /**
      * Reactive Streams publisher that buffers events until the SDK subscribes,
      * then delivers them in order. After subscription, events are forwarded immediately.
+     *
+     * <p>The {@code pending} queue is owned by the enclosing {@link SageMakerTransport} and
+     * shared across reconnect cycles, so events queued during an internal reset are drained
+     * onto whichever stream subscribes next.
      */
     static class StreamPublisher implements Publisher<RequestStreamEvent> {
         private volatile Subscriber<? super RequestStreamEvent> subscriber;
         private final AtomicBoolean completed = new AtomicBoolean(false);
-        private final ConcurrentLinkedQueue<RequestStreamEvent> pending = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<RequestStreamEvent> pending;
         private final CountDownLatch subscribed = new CountDownLatch(1);
+
+        StreamPublisher(ConcurrentLinkedQueue<RequestStreamEvent> sharedPending) {
+            this.pending = sharedPending;
+        }
 
         @Override
         public void subscribe(Subscriber<? super RequestStreamEvent> s) {
@@ -256,7 +398,8 @@ public class SageMakerTransport implements DeepgramTransport {
                     completed.set(true);
                 }
             });
-            // Flush any events that were queued before subscription
+            // Flush any events that were queued before subscription (including events that
+            // survived a previous internal reset).
             RequestStreamEvent event;
             while ((event = pending.poll()) != null) {
                 s.onNext(event);
@@ -270,7 +413,7 @@ public class SageMakerTransport implements DeepgramTransport {
             if (s != null) {
                 s.onNext(event);
             } else {
-                // Buffer until the SDK subscribes
+                // Buffer until the SDK subscribes (this stream or the next one after a reset)
                 pending.add(event);
             }
         }
@@ -284,8 +427,11 @@ public class SageMakerTransport implements DeepgramTransport {
             }
         }
 
-        void awaitSubscription(long timeout, TimeUnit unit) throws InterruptedException {
-            subscribed.await(timeout, unit);
+        /**
+         * @return {@code true} if subscription happened within the timeout, {@code false} on timeout.
+         */
+        boolean awaitSubscription(long timeout, TimeUnit unit) throws InterruptedException {
+            return subscribed.await(timeout, unit);
         }
     }
 }

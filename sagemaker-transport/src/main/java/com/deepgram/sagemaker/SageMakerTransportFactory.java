@@ -1,5 +1,6 @@
 package com.deepgram.sagemaker;
 
+import com.deepgram.core.ReconnectingWebSocketListener;
 import com.deepgram.core.transport.DeepgramTransport;
 import com.deepgram.core.transport.DeepgramTransportFactory;
 
@@ -78,6 +79,19 @@ public class SageMakerTransportFactory implements DeepgramTransportFactory {
         String queryString = uri.getQuery() != null ? uri.getQuery() : "";
 
         return new SageMakerTransport(smClient, config, invocationPath, queryString);
+    }
+
+    /**
+     * Disable the SDK's wrapper-level reconnect loop. {@link SageMakerTransport} owns its own
+     * retry/backoff/classification (see {@link SageMakerConfig#maxRetries()},
+     * {@link SageMakerConfig#retryBudget()}); wrapping it in another retry layer compounds
+     * transient AWS errors into Throttling-on-Throttling storms under burst load.
+     */
+    @Override
+    public ReconnectingWebSocketListener.ReconnectOptions reconnectOptions() {
+        return ReconnectingWebSocketListener.ReconnectOptions.builder()
+                .maxRetries(0)
+                .build();
     }
 
     /** Shut down the underlying AWS SDK client. */
