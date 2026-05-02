@@ -4,6 +4,7 @@ import com.deepgram.core.ReconnectingWebSocketListener;
 import com.deepgram.core.transport.DeepgramTransport;
 import com.deepgram.core.transport.DeepgramTransportFactory;
 
+import software.amazon.awssdk.awscore.retry.AwsRetryStrategy;
 import software.amazon.awssdk.http.Protocol;
 import software.amazon.awssdk.http.nio.netty.Http2Configuration;
 import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient;
@@ -103,6 +104,16 @@ public class SageMakerTransportFactory implements DeepgramTransportFactory {
     private static SageMakerRuntimeHttp2AsyncClient buildClient(SageMakerConfig config) {
         return SageMakerRuntimeHttp2AsyncClient.builder()
                 .region(config.region())
+                // Disable the AWS SDK's internal retry strategy. SageMakerTransport owns the
+                // retry policy (handleStreamError + ensureConnected backoff). The AWS SDK's
+                // default 3-attempt strategy compounds on top: every "1 retry" in our schedule
+                // becomes ~4 hits on the SageMaker frontline (the original attempt + 3 SDK
+                // retries with their own ~25/100/400 ms backoffs). Under a per-LB-IP throttle
+                // ceiling measured in requests/sec, that amplification keeps the conn pinned
+                // in the throttle window. AwsRetryStrategy.doNotRetry() removes the SDK layer;
+                // transient TLS / connection-reset hiccups are still caught by our IOException
+                // → RETRYABLE classification and the same backoff path.
+                .overrideConfiguration(c -> c.retryStrategy(AwsRetryStrategy.doNotRetry()))
                 .httpClientBuilder(
                         NettyNioAsyncHttpClient.builder()
                                 .protocol(Protocol.HTTP2)
