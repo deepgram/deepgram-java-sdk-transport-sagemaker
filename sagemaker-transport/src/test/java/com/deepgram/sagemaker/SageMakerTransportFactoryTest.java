@@ -189,4 +189,128 @@ class SageMakerTransportFactoryTest {
     assertNotNull(opts);
     assertEquals(0, opts.maxRetries);
   }
+
+  // -------------------------------------------------------------------------
+  // Shared-client pool tests. The default constructor backs the factory with a process-wide
+  // shared SageMakerRuntimeHttp2AsyncClient keyed by config fingerprint, so naive code that
+  // builds a fresh factory per stream still benefits from a single Netty pool underneath.
+  // -------------------------------------------------------------------------
+
+  @Test
+  void defaultConstructorReusesSharedClientAcrossFactoriesWithSameConfig() {
+    // Reset the shared pool to isolate this test from other tests in the class.
+    SageMakerTransportFactory.shutdownAllSharedClients();
+    try {
+      SageMakerConfig configA = SageMakerConfig.builder()
+          .endpointName("endpoint-A")  // endpoint name does NOT affect the shared client
+          .region("us-east-1")
+          .build();
+      SageMakerConfig configB = SageMakerConfig.builder()
+          .endpointName("endpoint-B")  // different endpoint, same Netty-relevant config
+          .region("us-east-1")
+          .build();
+
+      SageMakerTransportFactory f1 = new SageMakerTransportFactory(configA);
+      SageMakerTransportFactory f2 = new SageMakerTransportFactory(configB);
+
+      // Use reflection sparingly — verify both factories point at the same underlying smClient.
+      assertSame(getSmClient(f1), getSmClient(f2),
+          "factories with same Netty-relevant config must share one smClient");
+    } finally {
+      SageMakerTransportFactory.shutdownAllSharedClients();
+    }
+  }
+
+  @Test
+  void defaultConstructorBuildsDistinctSharedClientsForDifferentConfigs() {
+    SageMakerTransportFactory.shutdownAllSharedClients();
+    try {
+      SageMakerConfig configEast = SageMakerConfig.builder()
+          .endpointName("e").region("us-east-1").build();
+      SageMakerConfig configWest = SageMakerConfig.builder()
+          .endpointName("e").region("us-west-2").build();
+      SageMakerConfig configEastBigPool = SageMakerConfig.builder()
+          .endpointName("e").region("us-east-1").maxConcurrency(1000).build();
+
+      SageMakerTransportFactory east1 = new SageMakerTransportFactory(configEast);
+      SageMakerTransportFactory east2 = new SageMakerTransportFactory(configEast);
+      SageMakerTransportFactory west = new SageMakerTransportFactory(configWest);
+      SageMakerTransportFactory eastBig = new SageMakerTransportFactory(configEastBigPool);
+
+      assertSame(getSmClient(east1), getSmClient(east2));
+      assertNotSame(getSmClient(east1), getSmClient(west));
+      assertNotSame(getSmClient(east1), getSmClient(eastBig));
+    } finally {
+      SageMakerTransportFactory.shutdownAllSharedClients();
+    }
+  }
+
+  @Test
+  void byoClientConstructorIsNotPooled() {
+    SageMakerTransportFactory.shutdownAllSharedClients();
+    try {
+      SageMakerConfig config = SageMakerConfig.builder().endpointName("e").build();
+      SageMakerRuntimeHttp2AsyncClient mockClient = mock(SageMakerRuntimeHttp2AsyncClient.class);
+
+      SageMakerTransportFactory byo = new SageMakerTransportFactory(config, mockClient);
+      SageMakerTransportFactory shared = new SageMakerTransportFactory(config);
+
+      assertSame(mockClient, getSmClient(byo), "BYO factory must use the provided client");
+      assertNotSame(mockClient, getSmClient(shared),
+          "Shared factory must build/lookup its own client, not steal the BYO mock");
+    } finally {
+      SageMakerTransportFactory.shutdownAllSharedClients();
+    }
+  }
+
+  @Test
+  void shutdownIsNoopForBoth() {
+    // factory.shutdown() must not close shared or BYO clients — lifecycle belongs elsewhere.
+    SageMakerTransportFactory.shutdownAllSharedClients();
+    try {
+      SageMakerConfig config = SageMakerConfig.builder().endpointName("e").build();
+      SageMakerRuntimeHttp2AsyncClient mockClient = mock(SageMakerRuntimeHttp2AsyncClient.class);
+
+      new SageMakerTransportFactory(config, mockClient).shutdown();
+      verify(mockClient, never()).close();
+
+      SageMakerTransportFactory shared = new SageMakerTransportFactory(config);
+      shared.shutdown();
+      // We can't easily verify .close() wasn't called on a real client without re-fetching;
+      // the assertion above on mockClient is the strong guarantee. The shared variant is
+      // documented as no-op via Javadoc.
+    } finally {
+      SageMakerTransportFactory.shutdownAllSharedClients();
+    }
+  }
+
+  @Test
+  void shutdownAllSharedClientsClearsThePool() {
+    SageMakerTransportFactory.shutdownAllSharedClients();
+    SageMakerConfig config = SageMakerConfig.builder().endpointName("e").build();
+
+    SageMakerTransportFactory before = new SageMakerTransportFactory(config);
+    SageMakerRuntimeHttp2AsyncClient firstClient = getSmClient(before);
+
+    SageMakerTransportFactory.shutdownAllSharedClients();
+
+    SageMakerTransportFactory after = new SageMakerTransportFactory(config);
+    SageMakerRuntimeHttp2AsyncClient secondClient = getSmClient(after);
+
+    assertNotSame(firstClient, secondClient,
+        "shutdownAllSharedClients must clear the pool so the next factory builds a fresh client");
+
+    SageMakerTransportFactory.shutdownAllSharedClients();
+  }
+
+  /** Reflection helper — read the package-private smClient field set by the constructor. */
+  private static SageMakerRuntimeHttp2AsyncClient getSmClient(SageMakerTransportFactory f) {
+    try {
+      java.lang.reflect.Field fld = SageMakerTransportFactory.class.getDeclaredField("smClient");
+      fld.setAccessible(true);
+      return (SageMakerRuntimeHttp2AsyncClient) fld.get(f);
+    } catch (ReflectiveOperationException e) {
+      throw new RuntimeException(e);
+    }
+  }
 }

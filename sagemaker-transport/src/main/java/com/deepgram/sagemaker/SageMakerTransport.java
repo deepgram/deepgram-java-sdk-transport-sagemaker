@@ -16,6 +16,7 @@ import java.net.ConnectException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -28,6 +29,8 @@ import java.util.function.Consumer;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * {@link DeepgramTransport} implementation that routes Deepgram API calls through
@@ -46,6 +49,9 @@ import org.reactivestreams.Subscription;
  * </ul>
  */
 public class SageMakerTransport implements DeepgramTransport {
+
+    private static final Logger log = LoggerFactory.getLogger(SageMakerTransport.class);
+    private final String transportId = String.format("%08x", System.identityHashCode(this));
 
     private final SageMakerRuntimeHttp2AsyncClient smClient;
     private final SageMakerConfig config;
@@ -69,9 +75,15 @@ public class SageMakerTransport implements DeepgramTransport {
     // next stream attempt instead of being dropped with the discarded publisher.
     private final ConcurrentLinkedQueue<RequestStreamEvent> pending = new ConcurrentLinkedQueue<>();
 
-    // Retry budget tracking. Reset to 0 once a stream successfully establishes (subscription).
+    // Retry budget tracking. Reset to 0 once real downstream data flows back to the application
+    // (handlePayloadPart) — NOT on subscription success. Subscription succeeds in TLS+HTTP/2
+    // setup terms even when the bidi-stream request will be throttled milliseconds later.
     private final AtomicInteger retryAttempt = new AtomicInteger(0);
     private volatile long retryWindowStart = 0L;
+    // Earliest wall-clock at which the next attemptConnect is allowed to proceed. Set by
+    // handleStreamError so post-subscription throttles (which never reach the ensureConnected
+    // catch-block backoff) still pace the next attempt.
+    private volatile long retryNotBeforeMs = 0L;
 
     SageMakerTransport(
             SageMakerRuntimeHttp2AsyncClient smClient,
@@ -105,11 +117,34 @@ public class SageMakerTransport implements DeepgramTransport {
 
             Throwable lastError = null;
             while (true) {
+                // Honor backoff scheduled by handleStreamError so post-subscription throttles
+                // pace the next attempt (the catch-block backoff below never fires for those —
+                // attemptConnect succeeds, the throttle hits later).
+                long now = System.currentTimeMillis();
+                if (retryNotBeforeMs > now) {
+                    long sleepMs = retryNotBeforeMs - now;
+                    log.info("[{}] ensureConnected: honoring scheduled backoff ({}ms) before next attemptConnect",
+                            transportId, sleepMs);
+                    try {
+                        Thread.sleep(sleepMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted during scheduled backoff", lastError);
+                    }
+                }
+                int attemptBefore = retryAttempt.get();
+                log.info("[{}] ensureConnected: starting attemptConnect (attempt={}/{}, elapsed={}ms/{}ms)",
+                        transportId, attemptBefore, config.maxRetries(),
+                        System.currentTimeMillis() - retryWindowStart, config.retryBudget().toMillis());
                 try {
                     attemptConnect();
-                    // Success: reset retry budget for any future internal reconnects on this transport.
-                    retryAttempt.set(0);
-                    retryWindowStart = 0L;
+                    // Subscription succeeded — but DO NOT reset retryAttempt here. Subscription
+                    // success only proves TLS+HTTP/2 setup; the actual bidi-stream request can
+                    // still be throttled. We reset retryAttempt only when real downstream data
+                    // arrives, in handlePayloadPart.
+                    log.info("[{}] ensureConnected: attemptConnect SUCCEEDED (attempt={} — counter NOT reset; "
+                            + "waits for handlePayloadPart to confirm real data flow before resetting)",
+                            transportId, attemptBefore);
                     connected.set(true);
                     return;
                 } catch (Throwable t) {
@@ -119,11 +154,18 @@ public class SageMakerTransport implements DeepgramTransport {
                     long elapsed = System.currentTimeMillis() - retryWindowStart;
                     boolean budgetLeft = attempt < config.maxRetries()
                             && elapsed < config.retryBudget().toMillis();
+                    log.info("[{}] ensureConnected: attemptConnect FAILED — class={} attempt={}/{} elapsed={}ms/{}ms budgetLeft={} err={}",
+                            transportId, c, attempt, config.maxRetries(), elapsed,
+                            config.retryBudget().toMillis(), budgetLeft, summarize(t));
                     if (c == Classification.TERMINAL || !budgetLeft) {
+                        log.warn("[{}] ensureConnected: SURFACING (class={} budgetLeft={}) — err={}",
+                                transportId, c, budgetLeft, summarize(t));
                         if (t instanceof RuntimeException) throw (RuntimeException) t;
                         throw new RuntimeException(t);
                     }
                     long backoff = computeBackoff(attempt);
+                    log.info("[{}] ensureConnected: backoff={}ms before retry attempt {}",
+                            transportId, backoff, attempt + 1);
                     retryAttempt.incrementAndGet();
                     try {
                         Thread.sleep(backoff);
@@ -186,6 +228,7 @@ public class SageMakerTransport implements DeepgramTransport {
     private void handleStreamError(Throwable error) {
         if (closeSent.get()) {
             // Model idle timeout after CloseStream — treat as normal close.
+            log.info("[{}] handleStreamError: closeSent=true → treating as normal close", transportId);
             if (inputPublisher != null) inputPublisher.complete();
             notifyClose(1000, "Normal");
             return;
@@ -198,9 +241,27 @@ public class SageMakerTransport implements DeepgramTransport {
         boolean budgetLeft = attempt < config.maxRetries()
                 && elapsed < config.retryBudget().toMillis();
 
+        log.info("[{}] handleStreamError: class={} attempt={}/{} elapsed={}ms/{}ms budgetLeft={} err={}",
+                transportId, c, attempt, config.maxRetries(), elapsed,
+                config.retryBudget().toMillis(), budgetLeft, summarize(error));
+
         if (c == Classification.RETRYABLE && budgetLeft) {
-            // Internal reset: drop current stream, mark disconnected. Next send re-enters
-            // ensureConnected → attemptConnect, which will drain `pending` into the new stream.
+            // Internal reset: drop current stream, mark disconnected, and SCHEDULE a backoff so
+            // the next ensureConnected pause-then-reconnect rather than immediately hammering
+            // the AWS frontline. We don't sleep here (this runs on a Netty event-loop thread);
+            // we just set retryNotBeforeMs and the next ensureConnected honors it.
+            //
+            // We also advance retryAttempt and start the budget window if not already started,
+            // so under repeated post-subscription throttles the retry budget actually gets
+            // consumed and eventually surfaces a terminal error to the application.
+            if (retryWindowStart == 0L) {
+                retryWindowStart = System.currentTimeMillis();
+            }
+            int attemptForBackoff = retryAttempt.getAndIncrement();
+            long backoff = computeBackoff(attemptForBackoff);
+            retryNotBeforeMs = System.currentTimeMillis() + backoff;
+            log.info("[{}] handleStreamError: RETRYABLE → internal reset, attempt {} → scheduled backoff {}ms",
+                    transportId, attemptForBackoff + 1, backoff);
             connected.set(false);
             if (inputPublisher != null) inputPublisher.complete();
             if (streamFuture != null) {
@@ -214,9 +275,29 @@ public class SageMakerTransport implements DeepgramTransport {
         }
 
         // Terminal or budget-exhausted: surface to listeners.
+        log.warn("[{}] handleStreamError: SURFACING (class={} budgetLeft={}) → invoking {} errorListener(s)",
+                transportId, c, budgetLeft, errorListeners.size());
         for (Consumer<Throwable> l : errorListeners) {
             l.accept(error);
         }
+    }
+
+    /** One-line summary of a Throwable for log lines. */
+    private static String summarize(Throwable t) {
+        if (t == null) return "null";
+        String msg = t.getMessage();
+        if (msg == null) msg = "";
+        if (msg.length() > 160) msg = msg.substring(0, 157) + "...";
+        StringBuilder sb = new StringBuilder(t.getClass().getSimpleName()).append(": ").append(msg);
+        if (t instanceof AwsServiceException) {
+            AwsServiceException ase = (AwsServiceException) t;
+            sb.append(" [status=").append(ase.statusCode());
+            if (ase.awsErrorDetails() != null && ase.awsErrorDetails().errorCode() != null) {
+                sb.append(" code=").append(ase.awsErrorDetails().errorCode());
+            }
+            sb.append("]");
+        }
+        return sb.toString();
     }
 
     private long computeBackoff(int attempt) {
@@ -238,6 +319,14 @@ public class SageMakerTransport implements DeepgramTransport {
      */
     static Classification classify(Throwable error) {
         for (Throwable t = error; t != null; t = t.getCause()) {
+            // CancellationException is RETRYABLE because the cancel was either (a) induced by our
+            // own retry-reset path (in which case the next attempt will run cleanly) or (b) caused
+            // by some upstream terminal condition (in which case the retry attempt will hit the
+            // underlying error and classify it as TERMINAL on its own). Either way, treating the
+            // cancel itself as TERMINAL would surface a self-inflicted error to listeners.
+            // Covers AWS Netty's FutureCancelledException too — it wraps CancellationException as
+            // its cause.
+            if (t instanceof CancellationException) return Classification.RETRYABLE;
             if (t instanceof TimeoutException) return Classification.RETRYABLE;
             if (t instanceof ConnectException) return Classification.RETRYABLE;
             if (t instanceof IOException) return Classification.RETRYABLE;
@@ -253,6 +342,19 @@ public class SageMakerTransport implements DeepgramTransport {
                 String msg = t.getMessage() == null ? "" : t.getMessage().toLowerCase();
                 if (msg.contains("acquire") || msg.contains("pool") || msg.contains("throttl")
                         || msg.contains("timeout")) {
+                    return Classification.RETRYABLE;
+                }
+                // Credential-loading failures from the AWS SDK provider chain
+                // (`SdkClientException: Unable to load credentials from any of the providers...`).
+                // Retry only when at least one provider hit a transient AWS-side condition —
+                // typically AWS IAM Identity Center (SSO) or STS rate-limiting credential
+                // refreshes under burst load (Status Code: 429), or a 5xx from a credential
+                // backend. Pure misconfig (no provider has credentials at all) still surfaces
+                // fast — retrying won't conjure credentials that don't exist.
+                if (msg.contains("unable to load credentials")
+                        && (msg.contains("status code: 429")
+                                || msg.contains("status code: 5")
+                                || msg.contains("rate exceeded"))) {
                     return Classification.RETRYABLE;
                 }
             }
@@ -307,6 +409,19 @@ public class SageMakerTransport implements DeepgramTransport {
 
     private void handlePayloadPart(ResponsePayloadPart part) {
         byte[] bytes = part.bytes().asByteArray();
+
+        // First downstream data on this transport (or first since the last retry-loop reset) →
+        // the stream is genuinely working end-to-end, not just subscription-established. Reset
+        // the retry budget so a future transient failure gets a fresh budget.
+        if (retryAttempt.get() != 0 || retryWindowStart != 0L || retryNotBeforeMs != 0L) {
+            log.info("[{}] handlePayloadPart: data received ({}B) → resetting retry counters "
+                    + "(was attempt={}, windowStart={}, notBeforeMs={})",
+                    transportId, bytes.length,
+                    retryAttempt.get(), retryWindowStart, retryNotBeforeMs);
+            retryAttempt.set(0);
+            retryWindowStart = 0L;
+            retryNotBeforeMs = 0L;
+        }
 
         // JSON messages start with '{"' (0x7B 0x22). Checking two bytes avoids
         // false positives from binary audio chunks that happen to start with 0x7B.

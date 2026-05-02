@@ -165,6 +165,35 @@ SageMakerConfig config = SageMakerConfig.builder()
 Set `maxRetries(0)` to disable internal retry entirely (every transient AWS error then surfaces
 immediately to the application).
 
+#### Connection-pool sharing
+
+The default `new SageMakerTransportFactory(config)` constructor backs every factory instance with
+a **process-wide shared** `SageMakerRuntimeHttp2AsyncClient`, keyed by the parts of
+`SageMakerConfig` that affect the underlying Netty HTTP/2 client (region, max concurrency,
+connect/acquire timeouts). Multiple factories built with the same config fingerprint reuse one
+Netty event loop group and one connection pool — so naive code that constructs a fresh factory
+per stream still gets a single, well-behaved client underneath.
+
+Without sharing, every factory instantiates its own Netty pool, and a burst of N factories
+triggers N simultaneous TLS handshakes from N distinct Netty clients against the same SageMaker
+endpoint. Under high concurrency (100+ streams) the SageMaker HTTP/2 frontline silently drops a
+large fraction of those streams before they ever reach the model container — verified
+end-to-end with CloudWatch logs from a 400-stream burst test against a 1× ml.g6.2xlarge endpoint:
+without sharing, ~65% of streams never appeared in the Deepgram container's listen log; with
+sharing, the burst behaves the same as the canonical Python load-test harness.
+
+Lifecycle:
+
+| Constructor | Client backing | `factory.shutdown()` |
+|---|---|---|
+| `SageMakerTransportFactory(config)` | shared (lazy-init, keyed by config fingerprint) | no-op — call `SageMakerTransportFactory.shutdownAllSharedClients()` once at app shutdown to release Netty resources |
+| `SageMakerTransportFactory(config, smClient)` | caller-provided (BYO, used for testing or custom credential providers) | no-op — caller owns the client lifecycle |
+
+```java
+// At app shutdown — releases all shared Netty pools the plugin lazily created.
+Runtime.getRuntime().addShutdownHook(new Thread(SageMakerTransportFactory::shutdownAllSharedClients));
+```
+
 ### Custom AWS Client
 
 For custom credential providers, proxy configuration, or testing:

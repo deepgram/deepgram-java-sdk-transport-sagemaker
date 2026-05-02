@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.net.ConnectException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -94,6 +95,22 @@ class SageMakerTransportRetryTest {
         }
 
         @Test
+        @DisplayName("CancellationException is retryable (covers self-induced retry-reset cancels)")
+        void cancellationExceptionIsRetryable() {
+            assertEquals(SageMakerTransport.Classification.RETRYABLE,
+                    SageMakerTransport.classify(new CancellationException()));
+        }
+
+        @Test
+        @DisplayName("FutureCancelledException-style wrapper (RuntimeException with CancellationException cause) is retryable")
+        void cancellationWrappedInRuntimeIsRetryable() {
+            // Mirrors AWS Netty's FutureCancelledException, which extends RuntimeException and
+            // wraps a CancellationException as its cause.
+            RuntimeException wrapper = new RuntimeException("future cancelled", new CancellationException());
+            assertEquals(SageMakerTransport.Classification.RETRYABLE, SageMakerTransport.classify(wrapper));
+        }
+
+        @Test
         @DisplayName("AWS 429 (Too Many Requests) is retryable")
         void aws429IsRetryable() {
             AwsServiceException ase = AwsServiceException.builder()
@@ -153,6 +170,51 @@ class SageMakerTransportRetryTest {
                     .message("Connection pool exhausted")
                     .build();
             assertEquals(SageMakerTransport.Classification.RETRYABLE, SageMakerTransport.classify(sdke));
+        }
+
+        @Test
+        @DisplayName("'Unable to load credentials' is retryable when an SSO/STS provider hit Status Code: 429")
+        void credentialLoadFailureWithSsoThrottleIsRetryable() {
+            SdkException sdke = SdkException.builder()
+                    .message("Unable to load credentials from any of the providers in the chain "
+                            + "AwsCredentialsProviderChain(...): [..., "
+                            + "ProfileCredentialsProvider(profileName=shared-dev, ...): "
+                            + "HTTP 429 Unknown Code (Service: Sso, Status Code: 429, Request ID: abc) "
+                            + "(SDK Attempt Count: 4), ...]")
+                    .build();
+            assertEquals(SageMakerTransport.Classification.RETRYABLE,
+                    SageMakerTransport.classify(sdke));
+        }
+
+        @Test
+        @DisplayName("'Unable to load credentials' is retryable when a credential backend returned 5xx")
+        void credentialLoadFailureWith5xxIsRetryable() {
+            SdkException sdke = SdkException.builder()
+                    .message("Unable to load credentials from any of the providers in the chain "
+                            + "AwsCredentialsProviderChain(...): [..., "
+                            + "InstanceProfileCredentialsProvider(): "
+                            + "HTTP 503 (Service: Imds, Status Code: 503, Request ID: xyz)]")
+                    .build();
+            assertEquals(SageMakerTransport.Classification.RETRYABLE,
+                    SageMakerTransport.classify(sdke));
+        }
+
+        @Test
+        @DisplayName("'Unable to load credentials' is terminal when no provider had a transient cause")
+        void credentialLoadFailurePureMisconfigIsTerminal() {
+            SdkException sdke = SdkException.builder()
+                    .message("Unable to load credentials from any of the providers in the chain "
+                            + "AwsCredentialsProviderChain(...): ["
+                            + "SystemPropertyCredentialsProvider(): Access key must be specified..., "
+                            + "EnvironmentVariableCredentialsProvider(): Access key must be specified..., "
+                            + "WebIdentityTokenFileCredentialsProvider(): "
+                            + "Either the environment variable AWS_WEB_IDENTITY_TOKEN_FILE or the "
+                            + "javaproperty aws.webIdentityTokenFile must be set., "
+                            + "ContainerCredentialsProvider(): Cannot fetch credentials from container, "
+                            + "InstanceProfileCredentialsProvider(): Failed to load credentials from IMDS.]")
+                    .build();
+            assertEquals(SageMakerTransport.Classification.TERMINAL,
+                    SageMakerTransport.classify(sdke));
         }
 
         @Test
