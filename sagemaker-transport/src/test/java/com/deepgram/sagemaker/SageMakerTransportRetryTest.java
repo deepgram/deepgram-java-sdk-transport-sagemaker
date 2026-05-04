@@ -52,6 +52,13 @@ class SageMakerTransportRetryTest {
         };
     }
 
+    // RNG stubs for backoff tests — must live on outer class because @Nested inner classes can't
+    // have static members on Java 11.
+    private static final java.util.function.LongBinaryOperator MAX_RNG = (origin, bound) -> bound - 1;
+    private static final java.util.function.LongBinaryOperator MIN_RNG = (origin, bound) -> origin;
+    private static final java.util.function.LongBinaryOperator MID_RNG =
+            (origin, bound) -> origin + (bound - origin) / 2;
+
     private static class CapturingSubscriber implements Subscriber<RequestStreamEvent> {
         final List<RequestStreamEvent> received = new ArrayList<>();
         final CountDownLatch completed = new CountDownLatch(1);
@@ -398,6 +405,74 @@ class SageMakerTransportRetryTest {
             t.bufferForReplayForTest(payloadEvent("0123456789ABCDEF"), 16);
             assertEquals(0, t.replayBufferSize());
             assertEquals(0L, t.replayBufferBytes());
+        }
+    }
+
+    @Nested
+    @DisplayName("computeBackoff(initial, max, multiplier, attempt) — full jitter")
+    class ComputeBackoffTests {
+        @Test
+        @DisplayName("ceiling grows exponentially up to max; range is [initial, ceiling] inclusive")
+        void exponentialCeilingGrowth() {
+            // initial=100, multiplier=2 → ceilings 100, 200, 400, 800, 1600, capped at 1000.
+            // attempt=0: ceiling=initial=100 → degenerate range, returns 100 without RNG.
+            assertEquals(100L, SageMakerTransport.computeBackoff(100, 1000, 2.0, 0, MID_RNG));
+            // attempt=1: ceiling=200. Range=[100,201). MID_RNG returns origin + (bound-origin)/2 = 100 + 50 = 150.
+            assertEquals(150L, SageMakerTransport.computeBackoff(100, 1000, 2.0, 1, MID_RNG));
+            // attempt=4: scaled=1600, capped to ceiling=1000. Range=[100,1001). MID_RNG returns 100 + 450 = 550.
+            assertEquals(550L, SageMakerTransport.computeBackoff(100, 1000, 2.0, 4, MID_RNG));
+        }
+
+        @Test
+        @DisplayName("MIN_RNG returns the initial floor, MAX_RNG returns the ceiling")
+        void rngBoundsRespected() {
+            // attempt=2 with initial=100, mult=2: scaled=400, ceiling=400. Range=[100,401).
+            assertEquals(100L, SageMakerTransport.computeBackoff(100, 1000, 2.0, 2, MIN_RNG));
+            assertEquals(400L, SageMakerTransport.computeBackoff(100, 1000, 2.0, 2, MAX_RNG));
+        }
+
+        @Test
+        @DisplayName("ceiling caps at max regardless of attempt")
+        void ceilingCappedAtMax() {
+            // High attempt count would overflow without the cap.
+            assertEquals(5000L, SageMakerTransport.computeBackoff(100, 5000, 2.0, 100, MAX_RNG));
+            // Even infinity scaling caps cleanly.
+            assertEquals(5000L, SageMakerTransport.computeBackoff(100, 5000, 2.0, 10_000, MAX_RNG));
+        }
+
+        @Test
+        @DisplayName("when ceiling == initial (attempt=0 or multiplier degenerate), returns ceiling without invoking RNG")
+        void degenerateRangeReturnsCeiling() {
+            java.util.concurrent.atomic.AtomicInteger rngCalls = new java.util.concurrent.atomic.AtomicInteger(0);
+            java.util.function.LongBinaryOperator countingRng = (o, b) -> { rngCalls.incrementAndGet(); return o; };
+            assertEquals(100L, SageMakerTransport.computeBackoff(100, 1000, 2.0, 0, countingRng));
+            // multiplier=1.0 means scaled never grows beyond initial.
+            assertEquals(100L, SageMakerTransport.computeBackoff(100, 1000, 1.0, 5, countingRng));
+            assertEquals(0, rngCalls.get(), "RNG must not be invoked when range collapses to a single value");
+        }
+
+        @Test
+        @DisplayName("with real ThreadLocalRandom: 1000 samples spread continuously across [initial, ceiling]")
+        void productionRngSpreadsRetries() {
+            // The whole point of this fix: in production, N concurrent retries should NOT cluster
+            // at the same ceiling value. Sample many times and assert the spread is meaningful.
+            int trials = 1000;
+            long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
+            long sum = 0;
+            for (int i = 0; i < trials; i++) {
+                long b = SageMakerTransport.computeBackoff(
+                        100, 1000, 2.0, /*attempt*/ 4,
+                        java.util.concurrent.ThreadLocalRandom.current()::nextLong);
+                min = Math.min(min, b);
+                max = Math.max(max, b);
+                sum += b;
+            }
+            // attempt=4 → ceiling=1000, range=[100,1000]. Expected spread is large.
+            assertTrue(min < 200, "min sample should land near initial floor; got " + min);
+            assertTrue(max > 900, "max sample should land near ceiling; got " + max);
+            long mean = sum / trials;
+            assertTrue(mean > 400 && mean < 700,
+                    "mean of uniform [100,1000] should be near 550; got " + mean);
         }
     }
 }

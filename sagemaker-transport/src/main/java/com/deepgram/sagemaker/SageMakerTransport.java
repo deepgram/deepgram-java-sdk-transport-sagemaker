@@ -351,18 +351,39 @@ public class SageMakerTransport implements DeepgramTransport {
     }
 
     private long computeBackoff(int attempt) {
-        long initial = config.initialBackoff().toMillis();
-        long max = config.maxBackoff().toMillis();
-        double scaled = initial * Math.pow(config.backoffMultiplier(), attempt);
-        long ceiling = (scaled > max || Double.isInfinite(scaled)) ? max : Math.max(initial, (long) scaled);
-        // Full jitter: random in [initial, ceiling]. Without this, N conns failing simultaneously
-        // all compute the same backoff and retry in lockstep, hammering the endpoint in waves
-        // (worst case: every maxBackoff seconds the entire fleet retries together). Jitter spreads
-        // the retry load continuously over the backoff window.
-        if (ceiling <= initial) {
+        // Lambda re-resolves ThreadLocalRandom.current() at each invocation, so each calling thread
+        // gets its own per-thread RNG state — safe even if the LongBinaryOperator is cached and
+        // invoked from a different thread later (which the current call path doesn't do, but this
+        // is defensive). Method-reference form `ThreadLocalRandom.current()::nextLong` would
+        // capture whichever thread called computeBackoff first and wedge it as the RNG source.
+        return computeBackoff(
+                config.initialBackoff().toMillis(),
+                config.maxBackoff().toMillis(),
+                config.backoffMultiplier(),
+                attempt,
+                (origin, bound) -> ThreadLocalRandom.current().nextLong(origin, bound));
+    }
+
+    /**
+     * Pure-function backoff calculator with full jitter. Package-private + static for testability.
+     *
+     * <p>Without jitter, N conns failing simultaneously all compute the same exponential backoff
+     * and retry in lockstep, hammering the endpoint in waves (worst case: every {@code maxMs} the
+     * entire fleet retries together). Full jitter — random uniform in {@code [initialMs, ceiling]} —
+     * spreads the retry load continuously over the backoff window. See AWS Architecture Blog
+     * "Exponential Backoff and Jitter".
+     *
+     * @param randomLong injected RNG: {@code (originInclusive, boundExclusive) -> long}, allowing
+     *                   deterministic tests via a stub.
+     */
+    static long computeBackoff(long initialMs, long maxMs, double multiplier, int attempt,
+                               java.util.function.LongBinaryOperator randomLong) {
+        double scaled = initialMs * Math.pow(multiplier, attempt);
+        long ceiling = (scaled > maxMs || Double.isInfinite(scaled)) ? maxMs : Math.max(initialMs, (long) scaled);
+        if (ceiling <= initialMs) {
             return ceiling;
         }
-        return ThreadLocalRandom.current().nextLong(initial, ceiling + 1);
+        return randomLong.applyAsLong(initialMs, ceiling + 1);
     }
 
     enum Classification { RETRYABLE, TERMINAL }
