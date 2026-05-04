@@ -4,19 +4,15 @@ import com.deepgram.core.transport.DeepgramTransport;
 
 import software.amazon.awssdk.awscore.exception.AwsServiceException;
 import software.amazon.awssdk.core.SdkBytes;
-import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.SageMakerRuntimeHttp2AsyncClient;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.model.InvokeEndpointWithBidirectionalStreamRequest;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.model.InvokeEndpointWithBidirectionalStreamResponseHandler;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.model.RequestStreamEvent;
 import software.amazon.awssdk.services.sagemakerruntimehttp2.model.ResponsePayloadPart;
 
-import java.io.IOException;
-import java.net.ConnectException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -314,53 +310,39 @@ public class SageMakerTransport implements DeepgramTransport {
 
     /**
      * Classify an AWS-side exception as transient (retry internally, don't surface) vs terminal
-     * (surface to {@code errorListeners}). Walks the cause chain so SDK-wrapped exceptions are
-     * inspected too.
+     * (surface to {@code errorListeners}).
+     *
+     * <p>Default is RETRYABLE — the retry budget ({@link SageMakerConfig#retryBudget()}) is the
+     * safety net, not the classifier. Under high-burst load against SageMaker we've seen a
+     * long tail of transient failure modes (Netty WriteTimeout, HTTP/2 stream resets, SSO 429s,
+     * pool-acquire timeouts, AWS-frontline ThrottlingException) that the classifier kept missing
+     * one-by-one; flipping the default means a new transient hiccup retries instead of surfacing
+     * as a hard failure. The budget caps the worst case at the configured wall-clock anyway.
+     *
+     * <p>The narrow set we genuinely consider TERMINAL is caller-side rejections from AWS:
+     * an {@link AwsServiceException} with a 4xx status code (other than 429 and other than
+     * "throttling"-coded errors). Validation errors, AccessDenied, ResourceNotFound, etc. are
+     * authoritative — retrying won't change the outcome. Everything else, including the cause
+     * chain we don't recognize, defaults to RETRYABLE.
      */
     static Classification classify(Throwable error) {
         for (Throwable t = error; t != null; t = t.getCause()) {
-            // CancellationException is RETRYABLE because the cancel was either (a) induced by our
-            // own retry-reset path (in which case the next attempt will run cleanly) or (b) caused
-            // by some upstream terminal condition (in which case the retry attempt will hit the
-            // underlying error and classify it as TERMINAL on its own). Either way, treating the
-            // cancel itself as TERMINAL would surface a self-inflicted error to listeners.
-            // Covers AWS Netty's FutureCancelledException too — it wraps CancellationException as
-            // its cause.
-            if (t instanceof CancellationException) return Classification.RETRYABLE;
-            if (t instanceof TimeoutException) return Classification.RETRYABLE;
-            if (t instanceof ConnectException) return Classification.RETRYABLE;
-            if (t instanceof IOException) return Classification.RETRYABLE;
             if (t instanceof AwsServiceException) {
                 AwsServiceException ase = (AwsServiceException) t;
                 int status = ase.statusCode();
-                if (status == 429 || (status >= 500 && status < 600)) return Classification.RETRYABLE;
                 String code = ase.awsErrorDetails() != null ? ase.awsErrorDetails().errorCode() : null;
+                // Throttling is sometimes coded as 4xx (e.g. SageMaker frontline returns 400 with
+                // errorCode=ThrottlingException); always retry these regardless of status.
                 if (code != null && code.toLowerCase().contains("throttl")) return Classification.RETRYABLE;
-                return Classification.TERMINAL;
-            }
-            if (t instanceof SdkException) {
-                String msg = t.getMessage() == null ? "" : t.getMessage().toLowerCase();
-                if (msg.contains("acquire") || msg.contains("pool") || msg.contains("throttl")
-                        || msg.contains("timeout")) {
-                    return Classification.RETRYABLE;
-                }
-                // Credential-loading failures from the AWS SDK provider chain
-                // (`SdkClientException: Unable to load credentials from any of the providers...`).
-                // Retry only when at least one provider hit a transient AWS-side condition —
-                // typically AWS IAM Identity Center (SSO) or STS rate-limiting credential
-                // refreshes under burst load (Status Code: 429), or a 5xx from a credential
-                // backend. Pure misconfig (no provider has credentials at all) still surfaces
-                // fast — retrying won't conjure credentials that don't exist.
-                if (msg.contains("unable to load credentials")
-                        && (msg.contains("status code: 429")
-                                || msg.contains("status code: 5")
-                                || msg.contains("rate exceeded"))) {
-                    return Classification.RETRYABLE;
+                // 4xx (except 429) = caller-side rejection: validation, auth, notfound — won't
+                // fix on retry. 429 and 5xx fall through to the RETRYABLE default below.
+                if (status >= 400 && status < 500 && status != 429) {
+                    return Classification.TERMINAL;
                 }
             }
             if (t == t.getCause()) break;
         }
-        return Classification.TERMINAL;
+        return Classification.RETRYABLE;
     }
 
     @Override

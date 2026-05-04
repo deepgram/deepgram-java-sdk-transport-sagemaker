@@ -200,24 +200,6 @@ class SageMakerTransportRetryTest {
         }
 
         @Test
-        @DisplayName("'Unable to load credentials' is terminal when no provider had a transient cause")
-        void credentialLoadFailurePureMisconfigIsTerminal() {
-            SdkException sdke = SdkException.builder()
-                    .message("Unable to load credentials from any of the providers in the chain "
-                            + "AwsCredentialsProviderChain(...): ["
-                            + "SystemPropertyCredentialsProvider(): Access key must be specified..., "
-                            + "EnvironmentVariableCredentialsProvider(): Access key must be specified..., "
-                            + "WebIdentityTokenFileCredentialsProvider(): "
-                            + "Either the environment variable AWS_WEB_IDENTITY_TOKEN_FILE or the "
-                            + "javaproperty aws.webIdentityTokenFile must be set., "
-                            + "ContainerCredentialsProvider(): Cannot fetch credentials from container, "
-                            + "InstanceProfileCredentialsProvider(): Failed to load credentials from IMDS.]")
-                    .build();
-            assertEquals(SageMakerTransport.Classification.TERMINAL,
-                    SageMakerTransport.classify(sdke));
-        }
-
-        @Test
         @DisplayName("Walks the cause chain — IOException wrapped in RuntimeException is retryable")
         void walksCauseChain() {
             RuntimeException wrapper = new RuntimeException("oops", new IOException("netty"));
@@ -225,10 +207,47 @@ class SageMakerTransportRetryTest {
         }
 
         @Test
-        @DisplayName("Unknown exception defaults to terminal")
-        void unknownDefaultsToTerminal() {
-            assertEquals(SageMakerTransport.Classification.TERMINAL,
+        @DisplayName("Unknown exception defaults to RETRYABLE (budget is the safety net)")
+        void unknownDefaultsToRetryable() {
+            assertEquals(SageMakerTransport.Classification.RETRYABLE,
                     SageMakerTransport.classify(new RuntimeException("mystery")));
+        }
+
+        @Test
+        @DisplayName("Netty WriteTimeoutException-style RuntimeException is retryable by default")
+        void nettyWriteTimeoutIsRetryable() {
+            // io.netty.handler.timeout.WriteTimeoutException extends Netty's own TimeoutException
+            // (NOT java.util.concurrent.TimeoutException) which extends RuntimeException. We don't
+            // want to take a direct Netty compile dep just to instanceof-check it, so the new
+            // default-RETRYABLE policy covers this organically.
+            class WriteTimeoutException extends RuntimeException {
+                WriteTimeoutException() { super(); }
+            }
+            assertEquals(SageMakerTransport.Classification.RETRYABLE,
+                    SageMakerTransport.classify(new WriteTimeoutException()));
+        }
+
+        @Test
+        @DisplayName("AWS 400 (ValidationException) is terminal — caller-side rejection")
+        void aws400ValidationIsTerminal() {
+            AwsServiceException ase = AwsServiceException.builder()
+                    .message("invalid input")
+                    .statusCode(400)
+                    .awsErrorDetails(AwsErrorDetails.builder()
+                            .errorCode("ValidationException")
+                            .build())
+                    .build();
+            assertEquals(SageMakerTransport.Classification.TERMINAL, SageMakerTransport.classify(ase));
+        }
+
+        @Test
+        @DisplayName("AWS 404 (ResourceNotFound) is terminal — won't appear on retry")
+        void aws404IsTerminal() {
+            AwsServiceException ase = AwsServiceException.builder()
+                    .message("endpoint not found")
+                    .statusCode(404)
+                    .build();
+            assertEquals(SageMakerTransport.Classification.TERMINAL, SageMakerTransport.classify(ase));
         }
     }
 
