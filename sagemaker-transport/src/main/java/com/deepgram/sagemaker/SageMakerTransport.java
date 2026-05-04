@@ -19,6 +19,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -353,10 +354,15 @@ public class SageMakerTransport implements DeepgramTransport {
         long initial = config.initialBackoff().toMillis();
         long max = config.maxBackoff().toMillis();
         double scaled = initial * Math.pow(config.backoffMultiplier(), attempt);
-        if (scaled > max || Double.isInfinite(scaled)) {
-            return max;
+        long ceiling = (scaled > max || Double.isInfinite(scaled)) ? max : Math.max(initial, (long) scaled);
+        // Full jitter: random in [initial, ceiling]. Without this, N conns failing simultaneously
+        // all compute the same backoff and retry in lockstep, hammering the endpoint in waves
+        // (worst case: every maxBackoff seconds the entire fleet retries together). Jitter spreads
+        // the retry load continuously over the backoff window.
+        if (ceiling <= initial) {
+            return ceiling;
         }
-        return Math.max(initial, (long) scaled);
+        return ThreadLocalRandom.current().nextLong(initial, ceiling + 1);
     }
 
     enum Classification { RETRYABLE, TERMINAL }
