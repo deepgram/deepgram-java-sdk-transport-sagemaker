@@ -64,6 +64,38 @@ public class SageMakerConfig {
      */
     public static final long DEFAULT_MAX_REPLAY_BUFFER_BYTES = 8L * 1024 * 1024;
 
+    /**
+     * Max concurrent HTTP/2 streams multiplexed onto a single underlying TCP connection. Defaults
+     * to 1, which gives each bidi stream its own dedicated TCP connection — preventing slow-stream
+     * starvation but creating one HTTP/2 keep-alive ping cycle per logical stream. Under heavy
+     * concurrent load (hundreds of simultaneous streams from one process), the resulting flood of
+     * pings can saturate the Netty event-loop pool and trigger spurious {@code PingFailedException}
+     * connection teardowns. Raise this (e.g. 50–200) to multiplex many streams onto fewer
+     * connections and slash the ping load.
+     */
+    public static final long DEFAULT_MAX_STREAMS_PER_CONNECTION = 1L;
+
+    /**
+     * Number of Netty event-loop worker threads handling HTTP/2 frames for the shared client.
+     * {@code null} (the default) lets the AWS SDK Netty client pick — currently {@code 2 * NCPU}.
+     * Override when running large numbers of concurrent streams on hardware where the default
+     * leaves event loops saturated by inbound transcript frames + ping ACK bookkeeping.
+     */
+    public static final Integer DEFAULT_NETTY_EVENT_LOOP_THREADS = null;
+
+    /**
+     * Period between HTTP/2 keep-alive PING frames sent to the server, and the timeout for the
+     * PING ACK. {@code null} (the default) leaves the AWS SDK Netty client default in place
+     * (currently 5&nbsp;s). Under heavy single-process load (hundreds of concurrent streams
+     * sharing a small event-loop pool), 5 s is too tight: an event loop briefly busy processing
+     * inbound transcript frames can fail to read the PING ACK in time, causing
+     * {@code PingFailedException} → connection-death → cascading retries even though the
+     * underlying connection is healthy. Bump to 30&nbsp;s+ to tolerate moderate event-loop
+     * stalls; pass {@code Duration.ZERO} to disable PING frames entirely (the SDK's own retry
+     * + stream-error path will still detect genuinely-dead connections).
+     */
+    public static final Duration DEFAULT_HEALTH_CHECK_PING_PERIOD = null;
+
     private final String endpointName;
     private final Region region;
     private final String contentType;
@@ -78,6 +110,9 @@ public class SageMakerConfig {
     private final double backoffMultiplier;
     private final Duration retryBudget;
     private final long maxReplayBufferBytes;
+    private final long maxStreamsPerConnection;
+    private final Integer nettyEventLoopThreads;
+    private final Duration healthCheckPingPeriod;
 
     private SageMakerConfig(Builder builder) {
         this.endpointName = builder.endpointName;
@@ -94,6 +129,9 @@ public class SageMakerConfig {
         this.backoffMultiplier = builder.backoffMultiplier;
         this.retryBudget = builder.retryBudget;
         this.maxReplayBufferBytes = builder.maxReplayBufferBytes;
+        this.maxStreamsPerConnection = builder.maxStreamsPerConnection;
+        this.nettyEventLoopThreads = builder.nettyEventLoopThreads;
+        this.healthCheckPingPeriod = builder.healthCheckPingPeriod;
     }
 
     public String endpointName() { return endpointName; }
@@ -110,6 +148,9 @@ public class SageMakerConfig {
     public double backoffMultiplier() { return backoffMultiplier; }
     public Duration retryBudget() { return retryBudget; }
     public long maxReplayBufferBytes() { return maxReplayBufferBytes; }
+    public long maxStreamsPerConnection() { return maxStreamsPerConnection; }
+    public Integer nettyEventLoopThreads() { return nettyEventLoopThreads; }
+    public Duration healthCheckPingPeriod() { return healthCheckPingPeriod; }
 
     public static Builder builder() {
         return new Builder();
@@ -130,6 +171,9 @@ public class SageMakerConfig {
         private double backoffMultiplier = DEFAULT_BACKOFF_MULTIPLIER;
         private Duration retryBudget = DEFAULT_RETRY_BUDGET;
         private long maxReplayBufferBytes = DEFAULT_MAX_REPLAY_BUFFER_BYTES;
+        private long maxStreamsPerConnection = DEFAULT_MAX_STREAMS_PER_CONNECTION;
+        private Integer nettyEventLoopThreads = DEFAULT_NETTY_EVENT_LOOP_THREADS;
+        private Duration healthCheckPingPeriod = DEFAULT_HEALTH_CHECK_PING_PERIOD;
 
         public Builder endpointName(String endpointName) {
             this.endpointName = endpointName;
@@ -269,6 +313,46 @@ public class SageMakerConfig {
                 throw new IllegalArgumentException("maxReplayBufferBytes must be non-negative");
             }
             this.maxReplayBufferBytes = maxReplayBufferBytes;
+            return this;
+        }
+
+        /**
+         * Max concurrent HTTP/2 streams per underlying TCP connection. See
+         * {@link #DEFAULT_MAX_STREAMS_PER_CONNECTION}. Raise above 1 to multiplex many bidi
+         * streams onto fewer connections (slashes ping load); leave at 1 for one-stream-per-TCP
+         * isolation.
+         */
+        public Builder maxStreamsPerConnection(long maxStreamsPerConnection) {
+            if (maxStreamsPerConnection <= 0) {
+                throw new IllegalArgumentException("maxStreamsPerConnection must be positive");
+            }
+            this.maxStreamsPerConnection = maxStreamsPerConnection;
+            return this;
+        }
+
+        /**
+         * Number of Netty event-loop worker threads. {@code null} (default) uses the AWS SDK's
+         * default ({@code 2 * NCPU}). Override for high-burst single-process workloads where
+         * the default leaves event loops saturated by inbound frame processing.
+         */
+        public Builder nettyEventLoopThreads(Integer nettyEventLoopThreads) {
+            if (nettyEventLoopThreads != null && nettyEventLoopThreads <= 0) {
+                throw new IllegalArgumentException("nettyEventLoopThreads must be positive or null");
+            }
+            this.nettyEventLoopThreads = nettyEventLoopThreads;
+            return this;
+        }
+
+        /**
+         * Period between HTTP/2 keep-alive PING frames (and ACK timeout). {@code null} (default)
+         * uses the AWS SDK Netty client default (5&nbsp;s). Pass {@code Duration.ZERO} to disable
+         * PING frames entirely. See {@link #DEFAULT_HEALTH_CHECK_PING_PERIOD}.
+         */
+        public Builder healthCheckPingPeriod(Duration healthCheckPingPeriod) {
+            if (healthCheckPingPeriod != null && healthCheckPingPeriod.isNegative()) {
+                throw new IllegalArgumentException("healthCheckPingPeriod must be non-negative or null");
+            }
+            this.healthCheckPingPeriod = healthCheckPingPeriod;
             return this;
         }
 

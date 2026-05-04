@@ -303,6 +303,58 @@ class SageMakerTransportFactoryTest {
     SageMakerTransportFactory.shutdownAllSharedClients();
   }
 
+  @Test
+  void differentMaxStreamsForcesDistinctSharedClients() {
+    SageMakerTransportFactory.shutdownAllSharedClients();
+    SageMakerConfig one = SageMakerConfig.builder()
+        .endpointName("e").maxStreamsPerConnection(1).build();
+    SageMakerConfig hundred = SageMakerConfig.builder()
+        .endpointName("e").maxStreamsPerConnection(100).build();
+
+    SageMakerRuntimeHttp2AsyncClient c1 = getSmClient(new SageMakerTransportFactory(one));
+    SageMakerRuntimeHttp2AsyncClient c100 = getSmClient(new SageMakerTransportFactory(hundred));
+
+    assertNotSame(c1, c100,
+        "different maxStreamsPerConnection must produce distinct shared clients (different cache keys)");
+
+    SageMakerTransportFactory.shutdownAllSharedClients();
+  }
+
+  @Test
+  void differentNettyEventLoopThreadsForcesDistinctSharedClients() {
+    SageMakerTransportFactory.shutdownAllSharedClients();
+    SageMakerConfig dflt = SageMakerConfig.builder()
+        .endpointName("e").build();
+    SageMakerConfig eighty = SageMakerConfig.builder()
+        .endpointName("e").nettyEventLoopThreads(80).build();
+
+    SageMakerRuntimeHttp2AsyncClient cDefault = getSmClient(new SageMakerTransportFactory(dflt));
+    SageMakerRuntimeHttp2AsyncClient c80 = getSmClient(new SageMakerTransportFactory(eighty));
+
+    assertNotSame(cDefault, c80,
+        "different nettyEventLoopThreads must produce distinct shared clients (different cache keys)");
+
+    SageMakerTransportFactory.shutdownAllSharedClients();
+  }
+
+  @Test
+  void sameStreamAndEventLoopConfigSharesClient() {
+    SageMakerTransportFactory.shutdownAllSharedClients();
+    SageMakerConfig configA = SageMakerConfig.builder()
+        .endpointName("e-a").maxStreamsPerConnection(50).nettyEventLoopThreads(40).build();
+    SageMakerConfig configB = SageMakerConfig.builder()
+        .endpointName("e-b").maxStreamsPerConnection(50).nettyEventLoopThreads(40).build();
+
+    SageMakerRuntimeHttp2AsyncClient cA = getSmClient(new SageMakerTransportFactory(configA));
+    SageMakerRuntimeHttp2AsyncClient cB = getSmClient(new SageMakerTransportFactory(configB));
+
+    // endpointName differs but it's not in the cache key — the underlying Netty client should be shared.
+    assertSame(cA, cB,
+        "configs with same Netty-affecting fields share the underlying client even with different endpointName");
+
+    SageMakerTransportFactory.shutdownAllSharedClients();
+  }
+
   /** Reflection helper — read the package-private smClient field set by the constructor. */
   private static SageMakerRuntimeHttp2AsyncClient getSmClient(SageMakerTransportFactory f) {
     try {

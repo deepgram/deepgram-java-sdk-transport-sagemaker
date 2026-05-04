@@ -98,10 +98,30 @@ public class SageMakerTransportFactory implements DeepgramTransportFactory {
         return c.region().id()
                 + "|" + c.maxConcurrency()
                 + "|" + c.connectionTimeout().toMillis()
-                + "|" + c.connectionAcquireTimeout().toMillis();
+                + "|" + c.connectionAcquireTimeout().toMillis()
+                + "|" + c.maxStreamsPerConnection()
+                + "|" + (c.nettyEventLoopThreads() == null ? "default" : c.nettyEventLoopThreads())
+                + "|" + (c.healthCheckPingPeriod() == null ? "default" : c.healthCheckPingPeriod().toMillis());
     }
 
     private static SageMakerRuntimeHttp2AsyncClient buildClient(SageMakerConfig config) {
+        Http2Configuration.Builder http2Builder = Http2Configuration.builder()
+                .maxStreams(config.maxStreamsPerConnection());
+        if (config.healthCheckPingPeriod() != null) {
+            http2Builder.healthCheckPingPeriod(config.healthCheckPingPeriod());
+        }
+        NettyNioAsyncHttpClient.Builder httpBuilder = NettyNioAsyncHttpClient.builder()
+                .protocol(Protocol.HTTP2)
+                .maxConcurrency(config.maxConcurrency())
+                .connectionTimeout(config.connectionTimeout())
+                .connectionAcquisitionTimeout(config.connectionAcquireTimeout())
+                .http2Configuration(http2Builder.build());
+        if (config.nettyEventLoopThreads() != null) {
+            httpBuilder.eventLoopGroupBuilder(
+                    software.amazon.awssdk.http.nio.netty.SdkEventLoopGroup.builder()
+                            .numberOfThreads(config.nettyEventLoopThreads())
+            );
+        }
         return SageMakerRuntimeHttp2AsyncClient.builder()
                 .region(config.region())
                 // Disable the AWS SDK's internal retry strategy. SageMakerTransport owns the
@@ -114,18 +134,7 @@ public class SageMakerTransportFactory implements DeepgramTransportFactory {
                 // transient TLS / connection-reset hiccups are still caught by our IOException
                 // → RETRYABLE classification and the same backoff path.
                 .overrideConfiguration(c -> c.retryStrategy(AwsRetryStrategy.doNotRetry()))
-                .httpClientBuilder(
-                        NettyNioAsyncHttpClient.builder()
-                                .protocol(Protocol.HTTP2)
-                                .maxConcurrency(config.maxConcurrency())
-                                .connectionTimeout(config.connectionTimeout())
-                                .connectionAcquisitionTimeout(config.connectionAcquireTimeout())
-                                .http2Configuration(
-                                        Http2Configuration.builder()
-                                                .maxStreams(1L)
-                                                .build()
-                                )
-                )
+                .httpClientBuilder(httpBuilder)
                 .build();
     }
 
