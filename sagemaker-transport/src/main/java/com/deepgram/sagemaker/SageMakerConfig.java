@@ -48,6 +48,22 @@ public class SageMakerConfig {
     /** Total wall-clock budget across all retry attempts before giving up and surfacing the error. */
     public static final Duration DEFAULT_RETRY_BUDGET = Duration.ofSeconds(30);
 
+    /**
+     * Cap on the in-memory replay buffer that holds sent-but-unacked stream events for the
+     * current bidi stream attempt. If the SDK has to retry (throttling, post-subscription
+     * stream reset), this buffer is drained onto the new stream so AWS sees a continuous
+     * audio sequence instead of the gap created by the discarded events.
+     *
+     * <p>The buffer is trimmed when {@code handlePayloadPart} fires (the model just produced
+     * a transcript, so prior audio is acked from our perspective), so under steady-state
+     * operation it stays small (≤ a few hundred KB). It only grows during a throttle/reset
+     * window where no payload parts come back. 8&nbsp;MiB ≈ 256&nbsp;s of 16&nbsp;kHz mono
+     * 16-bit PCM, which covers the longest throttle storms we've seen in practice with
+     * margin to spare. Lower the cap for tight memory budgets; raise it if you expect
+     * longer retry windows per stream.
+     */
+    public static final long DEFAULT_MAX_REPLAY_BUFFER_BYTES = 8L * 1024 * 1024;
+
     private final String endpointName;
     private final Region region;
     private final String contentType;
@@ -61,6 +77,7 @@ public class SageMakerConfig {
     private final Duration maxBackoff;
     private final double backoffMultiplier;
     private final Duration retryBudget;
+    private final long maxReplayBufferBytes;
 
     private SageMakerConfig(Builder builder) {
         this.endpointName = builder.endpointName;
@@ -76,6 +93,7 @@ public class SageMakerConfig {
         this.maxBackoff = builder.maxBackoff;
         this.backoffMultiplier = builder.backoffMultiplier;
         this.retryBudget = builder.retryBudget;
+        this.maxReplayBufferBytes = builder.maxReplayBufferBytes;
     }
 
     public String endpointName() { return endpointName; }
@@ -91,6 +109,7 @@ public class SageMakerConfig {
     public Duration maxBackoff() { return maxBackoff; }
     public double backoffMultiplier() { return backoffMultiplier; }
     public Duration retryBudget() { return retryBudget; }
+    public long maxReplayBufferBytes() { return maxReplayBufferBytes; }
 
     public static Builder builder() {
         return new Builder();
@@ -110,6 +129,7 @@ public class SageMakerConfig {
         private Duration maxBackoff = DEFAULT_MAX_BACKOFF;
         private double backoffMultiplier = DEFAULT_BACKOFF_MULTIPLIER;
         private Duration retryBudget = DEFAULT_RETRY_BUDGET;
+        private long maxReplayBufferBytes = DEFAULT_MAX_REPLAY_BUFFER_BYTES;
 
         public Builder endpointName(String endpointName) {
             this.endpointName = endpointName;
@@ -236,6 +256,19 @@ public class SageMakerConfig {
                 throw new IllegalArgumentException("retryBudget must be positive");
             }
             this.retryBudget = retryBudget;
+            return this;
+        }
+
+        /**
+         * Cap on the in-memory replay buffer that holds sent-but-unacked stream events. Set to
+         * {@code 0} to disable replay (sent events are dropped on internal reset, matching the
+         * pre-replay-buffer behavior). See {@link #DEFAULT_MAX_REPLAY_BUFFER_BYTES}.
+         */
+        public Builder maxReplayBufferBytes(long maxReplayBufferBytes) {
+            if (maxReplayBufferBytes < 0) {
+                throw new IllegalArgumentException("maxReplayBufferBytes must be non-negative");
+            }
+            this.maxReplayBufferBytes = maxReplayBufferBytes;
             return this;
         }
 

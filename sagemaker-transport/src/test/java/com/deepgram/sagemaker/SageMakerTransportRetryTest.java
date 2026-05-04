@@ -249,6 +249,20 @@ class SageMakerTransportRetryTest {
                     .build();
             assertEquals(SageMakerTransport.Classification.TERMINAL, SageMakerTransport.classify(ase));
         }
+
+        @Test
+        @DisplayName("AWS 424 (Failed Dependency, SageMaker ModelError) is retryable — upstream container transient")
+        void aws424IsRetryable() {
+            // Mirrors the actual SageMaker burst-load error:
+            //   ModelErrorException: Received server error (424) from primary with message
+            //   "Failed to establish WebSocket connection"
+            AwsServiceException ase = AwsServiceException.builder()
+                    .message("Received server error (424) from primary with message "
+                          + "\"Failed to establish WebSocket connection\"")
+                    .statusCode(424)
+                    .build();
+            assertEquals(SageMakerTransport.Classification.RETRYABLE, SageMakerTransport.classify(ase));
+        }
     }
 
     @Nested
@@ -307,6 +321,83 @@ class SageMakerTransportRetryTest {
 
             assertEquals(1, sub.received.size());
             assertTrue(shared.isEmpty());
+        }
+    }
+
+    @Nested
+    @DisplayName("Replay buffer")
+    class ReplayBufferTests {
+        private SageMakerTransport newTransport(long maxReplayBufferBytes) {
+            SageMakerConfig cfg = SageMakerConfig.builder()
+                    .endpointName("test")
+                    .region("us-east-1")
+                    .maxReplayBufferBytes(maxReplayBufferBytes)
+                    .build();
+            // null AWS client is fine — these tests only exercise the in-memory buffer helpers,
+            // never attempt a real bidi stream.
+            return new SageMakerTransport(null, cfg, "v1/listen", "");
+        }
+
+        @Test
+        @DisplayName("buffer accumulates events with running byte count")
+        void bufferAccumulates() {
+            SageMakerTransport t = newTransport(1024);
+            t.bufferForReplayForTest(payloadEvent("aaa"), 3);
+            t.bufferForReplayForTest(payloadEvent("bbbbb"), 5);
+            assertEquals(2, t.replayBufferSize());
+            assertEquals(8L, t.replayBufferBytes());
+        }
+
+        @Test
+        @DisplayName("clearReplayBuffer drops everything (the AWS-acked path)")
+        void clearDropsAll() {
+            SageMakerTransport t = newTransport(1024);
+            t.bufferForReplayForTest(payloadEvent("a"), 1);
+            t.bufferForReplayForTest(payloadEvent("b"), 1);
+            t.clearReplayBufferForTest();
+            assertEquals(0, t.replayBufferSize());
+            assertEquals(0L, t.replayBufferBytes());
+        }
+
+        @Test
+        @DisplayName("FIFO eviction once cap exceeded — newest events kept, oldest dropped")
+        void evictionFifo() {
+            SageMakerTransport t = newTransport(10);  // cap = 10 bytes
+            RequestStreamEvent a = payloadEvent("aaaa");
+            RequestStreamEvent b = payloadEvent("bbbb");
+            RequestStreamEvent c = payloadEvent("cccc");
+            RequestStreamEvent d = payloadEvent("dddd");
+            t.bufferForReplayForTest(a, 4);   // total 4
+            t.bufferForReplayForTest(b, 4);   // total 8
+            t.bufferForReplayForTest(c, 4);   // total 12 → evict a, total 8
+            t.bufferForReplayForTest(d, 4);   // total 12 → evict b, total 8
+
+            // Latest two events should survive, oldest two evicted, ordering preserved.
+            java.util.List<RequestStreamEvent> remaining = t.drainReplayBufferForTest();
+            assertEquals(2, remaining.size());
+            assertSame(c, remaining.get(0), "oldest surviving event should be 'cccc'");
+            assertSame(d, remaining.get(1), "newest event should be 'dddd'");
+            assertEquals(8L, t.replayBufferBytes());
+        }
+
+        @Test
+        @DisplayName("maxReplayBufferBytes=0 disables buffering entirely")
+        void disabledByZeroCap() {
+            SageMakerTransport t = newTransport(0L);
+            t.bufferForReplayForTest(payloadEvent("a"), 1);
+            t.bufferForReplayForTest(payloadEvent("b"), 1);
+            assertEquals(0, t.replayBufferSize(), "events must not accumulate when cap=0");
+            assertEquals(0L, t.replayBufferBytes());
+        }
+
+        @Test
+        @DisplayName("oversized single event is dropped immediately by the eviction loop")
+        void oversizedEventCantStick() {
+            SageMakerTransport t = newTransport(10);
+            // A single 16-byte event exceeds the 10-byte cap; eviction loop should remove it.
+            t.bufferForReplayForTest(payloadEvent("0123456789ABCDEF"), 16);
+            assertEquals(0, t.replayBufferSize());
+            assertEquals(0L, t.replayBufferBytes());
         }
     }
 }

@@ -14,12 +14,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 import org.reactivestreams.Publisher;
@@ -71,6 +73,15 @@ public class SageMakerTransport implements DeepgramTransport {
     // next stream attempt instead of being dropped with the discarded publisher.
     private final ConcurrentLinkedQueue<RequestStreamEvent> pending = new ConcurrentLinkedQueue<>();
 
+    // Replay buffer: events sent on the current stream that AWS hasn't acked yet (no payload part
+    // received since they were sent). On internal reset (handleStreamError → RETRYABLE), the next
+    // attemptConnect drains this buffer onto the new stream so audio sent on the rejected stream
+    // isn't lost. Trimmed in handlePayloadPart (a transcript proves AWS has consumed prior audio)
+    // and capped at config.maxReplayBufferBytes() with FIFO eviction so unbounded throttle storms
+    // don't OOM the JVM.
+    private final ConcurrentLinkedDeque<BufferedEvent> replayBuffer = new ConcurrentLinkedDeque<>();
+    private final AtomicLong replayBufferBytes = new AtomicLong(0L);
+
     // Retry budget tracking. Reset to 0 once real downstream data flows back to the application
     // (handlePayloadPart) — NOT on subscription success. Subscription succeeds in TLS+HTTP/2
     // setup terms even when the bidi-stream request will be throttled milliseconds later.
@@ -103,9 +114,22 @@ public class SageMakerTransport implements DeepgramTransport {
      * via the caller's {@code send*} path.
      */
     private void ensureConnected() {
-        if (connected.get()) return;
+        // Fast path requires BOTH connected=true AND a live publisher. If either is false we
+        // re-enter the synchronized reconnect loop. Without the publisher liveness check, a
+        // race between handleStreamError (which sets connected=false then completes the
+        // publisher) and ensureConnected's tail (connected.set(true)) can leave us with
+        // connected=true pointing at a dead publisher — sends silently NOOP forever and the
+        // conn never recovers (root cause of the 44 silent conns observed in the
+        // 2026-05-03 replay-buffer-only test).
+        StreamPublisher pub = inputPublisher;
+        if (connected.get() && pub != null && !pub.isCompleted()) return;
         synchronized (connectLock) {
-            if (connected.get()) return;
+            pub = inputPublisher;
+            if (connected.get() && pub != null && !pub.isCompleted()) return;
+            // If we got here because the publisher died but connected was still true (the race
+            // above), tell the loop to start a fresh attempt rather than treat ourselves as
+            // already-connected.
+            connected.set(false);
 
             if (retryWindowStart == 0L) {
                 retryWindowStart = System.currentTimeMillis();
@@ -180,6 +204,20 @@ public class SageMakerTransport implements DeepgramTransport {
         StreamPublisher publisher = new StreamPublisher(pending);
         inputPublisher = publisher;
 
+        // Replay any unacked events from a prior failed stream attempt. They go through the
+        // publisher's pre-subscription pending queue and are flushed onto the new AWS subscriber
+        // as soon as it arrives — so AWS sees the buffered audio first, in order, before any
+        // new chunks the caller sends after this attempt succeeds.
+        if (!replayBuffer.isEmpty()) {
+            int count = replayBuffer.size();
+            long bytes = replayBufferBytes.get();
+            log.info("[{}] attemptConnect: replaying {} buffered events ({} bytes) onto new stream",
+                    transportId, count, bytes);
+            for (BufferedEvent be : replayBuffer) {
+                publisher.send(be.event);
+            }
+        }
+
         InvokeEndpointWithBidirectionalStreamRequest.Builder requestBuilder =
                 InvokeEndpointWithBidirectionalStreamRequest.builder()
                         .endpointName(config.endpointName())
@@ -213,6 +251,21 @@ public class SageMakerTransport implements DeepgramTransport {
             throw new TimeoutException(
                     "Timed out waiting for AWS SDK to subscribe to stream publisher after "
                             + config.subscriptionTimeout());
+        }
+
+        // Race guard: under high-concurrency burst-throttle, AWS sometimes accepts the
+        // subscription and IMMEDIATELY rejects the stream (ThrottlingException, ping-timeout).
+        // The handleStreamError callback fires on a Netty event-loop thread BEFORE attemptConnect
+        // returns from awaitSubscription, sets connected=false, and completes this publisher.
+        // If we then unconditionally let ensureConnected set connected=true, the audio thread
+        // takes the fast path and pushes chunks into a dead publisher — silently dropped, no
+        // transcripts ever come back. Detect the race here by re-checking the publisher's
+        // completion state and surfacing it as a transient failure so ensureConnected re-enters
+        // the retry loop on the next send.
+        if (publisher.isCompleted()) {
+            throw new IllegalStateException(
+                    "Stream rejected immediately after subscription (handleStreamError already "
+                  + "fired and completed the publisher); ensureConnected will re-attempt");
         }
     }
 
@@ -320,10 +373,16 @@ public class SageMakerTransport implements DeepgramTransport {
      * as a hard failure. The budget caps the worst case at the configured wall-clock anyway.
      *
      * <p>The narrow set we genuinely consider TERMINAL is caller-side rejections from AWS:
-     * an {@link AwsServiceException} with a 4xx status code (other than 429 and other than
+     * an {@link AwsServiceException} with a 4xx status code (other than 429, 424, and other than
      * "throttling"-coded errors). Validation errors, AccessDenied, ResourceNotFound, etc. are
      * authoritative — retrying won't change the outcome. Everything else, including the cause
      * chain we don't recognize, defaults to RETRYABLE.
+     *
+     * <p>424 (Failed Dependency) is treated as RETRYABLE because under burst load we observed
+     * SageMaker emitting {@code ModelErrorException: Received server error (424) from primary
+     * with message "Failed to establish WebSocket connection"} when the upstream model container
+     * couldn't accept a new stream at the moment of the request. The next attempt usually
+     * succeeds, so it doesn't belong in the caller-side-rejection bucket.
      */
     static Classification classify(Throwable error) {
         for (Throwable t = error; t != null; t = t.getCause()) {
@@ -334,9 +393,10 @@ public class SageMakerTransport implements DeepgramTransport {
                 // Throttling is sometimes coded as 4xx (e.g. SageMaker frontline returns 400 with
                 // errorCode=ThrottlingException); always retry these regardless of status.
                 if (code != null && code.toLowerCase().contains("throttl")) return Classification.RETRYABLE;
-                // 4xx (except 429) = caller-side rejection: validation, auth, notfound — won't
-                // fix on retry. 429 and 5xx fall through to the RETRYABLE default below.
-                if (status >= 400 && status < 500 && status != 429) {
+                // 4xx caller-side rejections: validation, auth, notfound — won't fix on retry.
+                // Exclusions: 429 (rate-limit, retry-with-backoff) and 424 (Failed Dependency,
+                // SageMaker upstream "Failed to establish WebSocket connection" — transient).
+                if (status >= 400 && status < 500 && status != 429 && status != 424) {
                     return Classification.TERMINAL;
                 }
             }
@@ -356,6 +416,7 @@ public class SageMakerTransport implements DeepgramTransport {
                 .bytes(SdkBytes.fromByteArray(data))
                 .build();
         inputPublisher.send(event);
+        bufferForReplay(event, data.length);
         return CompletableFuture.completedFuture(null);
     }
 
@@ -366,11 +427,13 @@ public class SageMakerTransport implements DeepgramTransport {
                     new IllegalStateException("Transport is closed"));
         }
         ensureConnected();
+        byte[] payload = data.getBytes(StandardCharsets.UTF_8);
         RequestStreamEvent event = RequestStreamEvent.payloadPartBuilder()
-                .bytes(SdkBytes.fromByteArray(data.getBytes(StandardCharsets.UTF_8)))
+                .bytes(SdkBytes.fromByteArray(payload))
                 .dataType("UTF8")
                 .build();
         inputPublisher.send(event);
+        bufferForReplay(event, payload.length);
 
         // Track that we've signaled end-of-audio so we can treat the model's
         // idle timeout as a normal close rather than an error.
@@ -379,6 +442,44 @@ public class SageMakerTransport implements DeepgramTransport {
         }
 
         return CompletableFuture.completedFuture(null);
+    }
+
+    /**
+     * Append {@code event} to the replay buffer for re-delivery on a future internal reset.
+     * Evicts oldest events FIFO once the configured byte cap is exceeded so an unbounded
+     * throttle storm can't OOM the JVM. Caller passes the payload byte length so we don't
+     * have to re-walk the SdkBytes wrapper (which would double-allocate on every send).
+     */
+    private void bufferForReplay(RequestStreamEvent event, int eventBytes) {
+        long cap = config.maxReplayBufferBytes();
+        if (cap == 0L) return;  // replay disabled
+        replayBuffer.addLast(new BufferedEvent(event, eventBytes));
+        long total = replayBufferBytes.addAndGet(eventBytes);
+        while (total > cap) {
+            BufferedEvent dropped = replayBuffer.pollFirst();
+            if (dropped == null) break;
+            total = replayBufferBytes.addAndGet(-dropped.bytes);
+        }
+    }
+
+    /** Drain the replay buffer (e.g. after AWS acks via {@code handlePayloadPart}). */
+    private void clearReplayBuffer() {
+        replayBuffer.clear();
+        replayBufferBytes.set(0L);
+    }
+
+    // Test-only accessors. Package-private so unit tests in the same package can verify buffer
+    // behavior without going through the full AWS reactive-streams stack.
+    int replayBufferSize() { return replayBuffer.size(); }
+    long replayBufferBytes() { return replayBufferBytes.get(); }
+    void bufferForReplayForTest(RequestStreamEvent event, int eventBytes) {
+        bufferForReplay(event, eventBytes);
+    }
+    void clearReplayBufferForTest() { clearReplayBuffer(); }
+    java.util.List<RequestStreamEvent> drainReplayBufferForTest() {
+        java.util.List<RequestStreamEvent> out = new java.util.ArrayList<>(replayBuffer.size());
+        for (BufferedEvent be : replayBuffer) out.add(be.event);
+        return out;
     }
 
     private void notifyClose(int code, String reason) {
@@ -392,23 +493,58 @@ public class SageMakerTransport implements DeepgramTransport {
     private void handlePayloadPart(ResponsePayloadPart part) {
         byte[] bytes = part.bytes().asByteArray();
 
-        // First downstream data on this transport (or first since the last retry-loop reset) →
-        // the stream is genuinely working end-to-end, not just subscription-established. Reset
-        // the retry budget so a future transient failure gets a fresh budget.
-        if (retryAttempt.get() != 0 || retryWindowStart != 0L || retryNotBeforeMs != 0L) {
-            log.info("[{}] handlePayloadPart: data received ({}B) → resetting retry counters "
-                    + "(was attempt={}, windowStart={}, notBeforeMs={})",
-                    transportId, bytes.length,
-                    retryAttempt.get(), retryWindowStart, retryNotBeforeMs);
-            retryAttempt.set(0);
-            retryWindowStart = 0L;
-            retryNotBeforeMs = 0L;
+        // Decode once. JSON messages start with '{"' (0x7B 0x22) — checking two bytes avoids
+        // false positives from binary audio chunks that happen to start with 0x7B.
+        boolean isJson = bytes.length > 1 && bytes[0] == '{' && bytes[1] == '"';
+        String text = isJson ? new String(bytes, StandardCharsets.UTF_8) : null;
+
+        // Decide whether this payload counts as "the model consumed input" — the signal that
+        // makes it safe to reset retry counters and trim the replay buffer.
+        //
+        // Rather than enumerate every downstream message type per Deepgram product (Listen STT
+        // emits `Results`, Flux emits `TurnInfo`, Speak/Aura emits binary audio chunks, ...),
+        // we invert the check: assume ANY downstream payload counts as a real ack EXCEPT for
+        // end-of-stream-only message types that the container can emit without having consumed
+        // input. Two types are documented to fire at close regardless of consumption:
+        //
+        //   - `Metadata` — end-of-stream summary. Under burst-replay we observed the container
+        //     emitting `Metadata` (sha256="incomplete", duration=0) when the model errored out
+        //     before producing any transcript; the original code treated this as an ack and
+        //     cleared the replay buffer, so the next retry had nothing to replay and the
+        //     replayed audio was lost (root cause of conn 125-style front-loss in the
+        //     2026-05-03 RC run).
+        //   - `Error` — model-side fatal error message, also typically sent at close.
+        //
+        // Anything else — Results, TurnInfo, EndOfTurn, Warning, SpeechStarted, UtteranceEnd,
+        // raw binary audio (TTS) — represents real model activity and is safe to trust.
+        boolean isCloseOnlyMessage = isJson
+                && (text.contains("\"type\":\"Metadata\"") || text.contains("\"type\":\"Error\""));
+        boolean countsAsAck = !isCloseOnlyMessage;
+
+        if (countsAsAck) {
+            // Real downstream content on this transport (or first since the last retry-loop
+            // reset) → the stream is genuinely working end-to-end. Reset the retry budget so a
+            // future transient failure gets a fresh budget.
+            if (retryAttempt.get() != 0 || retryWindowStart != 0L || retryNotBeforeMs != 0L) {
+                log.info("[{}] handlePayloadPart: ack-class data received ({}B) → resetting retry counters "
+                        + "(was attempt={}, windowStart={}, notBeforeMs={})",
+                        transportId, bytes.length,
+                        retryAttempt.get(), retryWindowStart, retryNotBeforeMs);
+                retryAttempt.set(0);
+                retryWindowStart = 0L;
+                retryNotBeforeMs = 0L;
+            }
+
+            // The model produced output → it consumed input up to (at least) the moment this
+            // part's window started. Drop the replay buffer; if a retry happens later, we only
+            // need to replay events sent SINCE this ack. The model's internal latency means a
+            // small leading window (< 1 s, typically) of audio sent just before the failure
+            // might be re-transcribed on the new stream — net impact is a brief duplicate, far
+            // better than dropping 30+ s of audio outright.
+            clearReplayBuffer();
         }
 
-        // JSON messages start with '{"' (0x7B 0x22). Checking two bytes avoids
-        // false positives from binary audio chunks that happen to start with 0x7B.
-        if (bytes.length > 1 && bytes[0] == '{' && bytes[1] == '"') {
-            String text = new String(bytes, StandardCharsets.UTF_8);
+        if (isJson) {
             for (Consumer<String> l : messageListeners) {
                 l.accept(text);
             }
@@ -453,13 +589,29 @@ public class SageMakerTransport implements DeepgramTransport {
     @Override
     public void close() {
         if (!open.compareAndSet(true, false)) return;
-        // Terminal close — drop any messages that were queued during a reset window.
+        // Terminal close — drop any messages that were queued during a reset window, and free the
+        // replay buffer so we don't pin its memory after the transport is done.
         pending.clear();
+        clearReplayBuffer();
         if (inputPublisher != null) {
             inputPublisher.complete();
         }
         if (streamFuture != null) {
             streamFuture.cancel(true);
+        }
+    }
+
+    /**
+     * Replay-buffer entry — keeps the byte length alongside the event so the cap-and-evict path
+     * doesn't have to peek inside SdkBytes (which would incur an extra copy on every send).
+     */
+    static final class BufferedEvent {
+        final RequestStreamEvent event;
+        final int bytes;
+
+        BufferedEvent(RequestStreamEvent event, int bytes) {
+            this.event = event;
+            this.bytes = bytes;
         }
     }
 
@@ -529,6 +681,16 @@ public class SageMakerTransport implements DeepgramTransport {
          */
         boolean awaitSubscription(long timeout, TimeUnit unit) throws InterruptedException {
             return subscribed.await(timeout, unit);
+        }
+
+        /**
+         * @return {@code true} if {@link #complete()} or the subscriber's cancel hook has fired.
+         *         Used by the {@code attemptConnect} race-guard to detect when handleStreamError
+         *         has already torn down the publisher between subscription and the
+         *         {@code connected.set(true)} fast-path.
+         */
+        boolean isCompleted() {
+            return completed.get();
         }
     }
 }
