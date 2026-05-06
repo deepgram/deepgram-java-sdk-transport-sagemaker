@@ -9,6 +9,7 @@ import com.deepgram.resources.listen.v2.websocket.V2WebSocketClient;
 import com.deepgram.sagemaker.SageMakerConfig;
 import com.deepgram.sagemaker.SageMakerTransportFactory;
 import com.deepgram.types.ListenV2Encoding;
+import com.deepgram.types.ListenV2Model;
 import com.deepgram.types.ListenV2SampleRate;
 
 import javax.sound.sampled.AudioFormat;
@@ -100,7 +101,7 @@ public class LiveMicFluxSageMakerExample {
 
         CompletableFuture<Void> connectFuture = wsClient.connect(
                 V2ConnectOptions.builder()
-                        .model("flux-general-en")
+                        .model(ListenV2Model.FLUX_GENERAL_EN)
                         .encoding(ListenV2Encoding.LINEAR16)
                         .sampleRate(ListenV2SampleRate.of(16000))
                         .build());

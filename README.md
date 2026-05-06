@@ -11,7 +11,7 @@ SageMaker transport for the [Deepgram Java SDK](https://github.com/deepgram/deep
 
 ```groovy
 dependencies {
-    implementation 'com.deepgram:deepgram-java-sdk:0.3.0'
+    implementation 'com.deepgram:deepgram-java-sdk:0.4.0'
     implementation 'com.deepgram:deepgram-sagemaker:0.1.2' // x-release-please-version
 }
 ```
@@ -29,7 +29,7 @@ dependencies {
 ## Requirements
 
 - Java 11+
-- [Deepgram Java SDK](https://github.com/deepgram/deepgram-java-sdk) v0.3.0+ (the `default ReconnectOptions reconnectOptions()` hook on `DeepgramTransportFactory` is required for storm absorption)
+- [Deepgram Java SDK](https://github.com/deepgram/deepgram-java-sdk) v0.4.0+ (the `default ReconnectOptions reconnectOptions()` hook on `DeepgramTransportFactory` is required for storm absorption)
 - AWS credentials configured (environment variables, shared credentials file, or IAM role)
 - A Deepgram model deployed to an AWS SageMaker endpoint
 
