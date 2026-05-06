@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.2...v0.1.3) (2026-05-06)
+
+
+### Features
+
+* configurable timeouts and concurrency with lenient defaults for high-burst workloads ([#14](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/issues/14)) ([78b6338](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/commit/78b63386fc094e90cf1aca7e0ea19e458b8dd4d1))
+
 ## [0.1.2](https://github.com/deepgram/deepgram-java-sdk-transport-sagemaker/compare/v0.1.1...v0.1.2) (2026-04-13)
 
 
