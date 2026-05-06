@@ -8,6 +8,7 @@ import com.deepgram.resources.listen.v2.websocket.V2ConnectOptions;
 import com.deepgram.resources.listen.v2.websocket.V2WebSocketClient;
 import com.deepgram.sagemaker.SageMakerConfig;
 import com.deepgram.sagemaker.SageMakerTransportFactory;
+import com.deepgram.types.ListenV2Model;
 
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
@@ -85,10 +86,10 @@ public class FluxSageMakerExample {
             done.countDown();
         });
 
-        // Connect — V2 uses model name as string via additionalProperty
+        // Connect using the typed Flux model constant from the SDK.
         CompletableFuture<Void> connectFuture = wsClient.connect(
                 V2ConnectOptions.builder()
-                        .model("flux-general-en")
+                        .model(ListenV2Model.FLUX_GENERAL_EN)
                         .build());
         connectFuture.get(30, TimeUnit.SECONDS);
         System.out.println("Connected. Streaming audio...\n");
